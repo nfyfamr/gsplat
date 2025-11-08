@@ -3,6 +3,8 @@
 #include <c10/cuda/CUDAStream.h>
 #include <cooperative_groups.h>
 
+#include <cub/cub.cuh>
+
 #include "Common.h"
 #include "Rasterization.h"
 
@@ -58,11 +60,24 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
                                              // indices in [I * N] or [nnz] from
                                              // `isect_tiles()`.
 
+    // efficient backward
+    const int32_t *__restrict__ per_tile_bucket_offset,
+    int32_t *__restrict__ bucket_to_tile,
+    scalar_t *__restrict__ sampled_T,
+    scalar_t *__restrict__ sampled_ar,
+    scalar_t *__restrict__ sampled_an,
+    scalar_t *__restrict__ sampled_avd,
+    scalar_t *__restrict__ sampled_aw,
+    scalar_t *__restrict__ sampled_avwd,
+    int32_t *__restrict__ max_contrib,
+
     // outputs
     scalar_t
         *__restrict__ render_colors, // [..., image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas,  // [..., image_height, image_width, 1]
     scalar_t *__restrict__ render_normals, // [..., image_height, image_width, 3]
+    scalar_t *__restrict__ render_vis_wd, // [..., image_height, image_width, 1]
+    scalar_t *__restrict__ render_w, // [..., image_height, image_width, 1]
     scalar_t *__restrict__ render_distort, // [..., image_height, image_width, 1]
                                            // // Stores the per-pixel distortion
                                            // error proposed in Mip-NeRF 360.
@@ -207,6 +222,8 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
     // https://github.com/nerfstudio-project/nerfacc/blob/master/nerfacc/losses.py#L7
     float distort = 0.f;
     float accum_vis_depth = 0.f; // accumulate vis * depth
+    float accum_w = 0.f;         // accumulate vis
+    float accum_vis_wd = 0.f;    // accumulate vis * (depth * accum_w - accum_vis_depth)
 
     // keep track of median depth contribution
     float median_depth = 0.f;
@@ -225,6 +242,23 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
     //  float pix_out[CDIM + 3] = {0.f}
     float pix_out[CDIM] = {0.f};
     float normal_out[3] = {0.f};
+    
+    // efficient backward
+    const uint32_t GLOBAL_TILE_ID = image_id * tile_height * tile_width + tile_id;
+    const uint32_t NUM_GAUSSIANS_IN_TILE = range_end - range_start;
+    const uint32_t NUM_BUCKETS_IN_TILE = (NUM_GAUSSIANS_IN_TILE + 31) / 32;
+    uint32_t bbm_current = (GLOBAL_TILE_ID == 0) ? 0 : per_tile_bucket_offset[GLOBAL_TILE_ID - 1];
+    uint32_t bucket_idx_counter = 0;
+
+    // bucket-to-tile mapping
+    for (int i_map = 0; i_map < (NUM_BUCKETS_IN_TILE + block_size - 1) / block_size; ++i_map) {
+        int bucket_idx = i_map * block_size + tr;
+        if (bucket_idx < NUM_BUCKETS_IN_TILE) {
+            bucket_to_tile[bbm_current + bucket_idx] = GLOBAL_TILE_ID;
+        }
+    }
+    block.sync();
+
     for (uint32_t b = 0; b < num_batches; ++b) {
         // resync all threads before beginning next batch
         // end early if entire tile is done
@@ -322,6 +356,26 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
         // process gaussians in the current batch for this pixel
         uint32_t batch_size = min(block_size, range_end - batch_start);
         for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
+            // add incoming T and accumulated radiance (ar) value for every 32nd gaussian
+            uint32_t global_gaussian_idx_in_tile = b * block_size + t;
+            if (t % 32 == 0) {
+                uint32_t sample_bucket_idx = bbm_current + bucket_idx_counter;
+                sampled_T[(sample_bucket_idx * block_size) + tr] = T;
+                for (uint32_t ch = 0; ch < CDIM; ++ch) {
+                    uint32_t ar_idx = (sample_bucket_idx * block_size * CDIM) + (ch * block_size) + tr;
+                    sampled_ar[ar_idx] = pix_out[ch];
+                }
+                for (uint32_t k = 0; k < 3; ++k) {
+                    uint32_t arn_idx = (sample_bucket_idx * block_size * 3) + (k * block_size) + tr;
+                    sampled_an[arn_idx] = normal_out[k];
+                }
+                if (render_distort != nullptr) {
+                    sampled_avd[(sample_bucket_idx * block_size) + tr] = accum_vis_depth;
+                    sampled_aw[(sample_bucket_idx * block_size) + tr] = accum_w;
+                    sampled_avwd[(sample_bucket_idx * block_size) + tr] = accum_vis_wd;
+                }
+                bucket_idx_counter++;
+            }
 
             const vec3 xy_opac = xy_opacity_batch[t];
             const float opac = xy_opac.z;
@@ -397,6 +451,8 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
                 const float distort_bi_1 = vis * accum_vis_depth;
                 distort += 2.0f * (distort_bi_0 - distort_bi_1);
                 accum_vis_depth += vis * depth;
+                accum_w += vis;
+                accum_vis_wd += vis * (depth * accum_w - accum_vis_depth);
             }
 
             // compute median depth
@@ -432,11 +488,21 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
 
         if (render_distort != nullptr) {
             render_distort[pix_id] = distort;
+            render_vis_wd[pix_id] = accum_vis_wd;
+            render_w[pix_id] = accum_w;
         }
 
         render_median[pix_id] = median_depth;
         // index in bin of gaussian that contributes to median depth
         median_ids[pix_id] = static_cast<int32_t>(median_idx);
+    }
+
+    // max reduce the last contributor
+    typedef cub::BlockReduce<uint32_t, 256> BlockReduce;  // hard-typed block_size 
+    __shared__ typename BlockReduce::TempStorage temp_storage;
+    cur_idx = BlockReduce(temp_storage).Reduce(cur_idx, cub::Max());
+    if (tr == 0) {
+        max_contrib[GLOBAL_TILE_ID] = cur_idx;
     }
 }
 
@@ -457,10 +523,22 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
+    // efficient backward
+    const at::Tensor per_tile_bucket_offset,
+    at::Tensor bucket_to_tile,
+    at::Tensor sampled_T,
+    at::Tensor sampled_ar,
+    at::Tensor sampled_an,
+    at::Tensor sampled_avd,
+    at::Tensor sampled_aw,
+    at::Tensor sampled_avwd,
+    at::Tensor max_contrib,
     // outputs
     at::Tensor renders,        // [..., image_height, image_width, channels]
     at::Tensor alphas,         // [..., image_height, image_width]
     at::Tensor render_normals, // [..., image_height, image_width, 3]
+    at::Tensor render_vis_wd,  // [..., image_height, image_width, 1]
+    at::Tensor render_w,       // [..., image_height, image_width, 1]
     at::Tensor render_distort, // [..., image_height, image_width]
     at::Tensor render_median,  // [..., image_height, image_width]
     at::Tensor last_ids,       // [..., image_height, image_width]
@@ -519,9 +597,20 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
             tile_height,
             tile_offsets.data_ptr<int32_t>(),
             flatten_ids.data_ptr<int32_t>(),
+            per_tile_bucket_offset.data_ptr<int32_t>(),
+            bucket_to_tile.data_ptr<int32_t>(),
+            sampled_T.data_ptr<float>(),
+            sampled_ar.data_ptr<float>(),
+            sampled_an.data_ptr<float>(),
+            sampled_avd.data_ptr<float>(),
+            sampled_aw.data_ptr<float>(),
+            sampled_avwd.data_ptr<float>(),
+            max_contrib.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             render_normals.data_ptr<float>(),
+            render_vis_wd.data_ptr<float>(),
+            render_w.data_ptr<float>(),
             render_distort.data_ptr<float>(),
             render_median.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
@@ -546,9 +635,20 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
         uint32_t tile_size,                                                    \
         const at::Tensor tile_offsets,                                         \
         const at::Tensor flatten_ids,                                          \
+        const at::Tensor per_tile_bucket_offset,                               \
+        at::Tensor bucket_to_tile,                                             \
+        at::Tensor sampled_T,                                                  \
+        at::Tensor sampled_ar,                                                 \
+        at::Tensor sampled_an,                                                 \
+        at::Tensor sampled_avd,                                                \
+        at::Tensor sampled_aw,                                                 \
+        at::Tensor sampled_avwd,                                               \
+        at::Tensor max_contrib,                                                \
         at::Tensor renders,                                                    \
         at::Tensor alphas,                                                     \
         at::Tensor render_normals,                                             \
+        at::Tensor render_vis_wd,                                              \
+        at::Tensor render_w,                                                   \
         at::Tensor render_distort,                                             \
         at::Tensor render_median,                                              \
         at::Tensor last_ids,                                                   \

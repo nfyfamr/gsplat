@@ -393,4 +393,43 @@ void segmented_radix_sort_double_buffer(
     }
 }
 
+__global__ void bucket_count_kernel(
+    const int64_t T,
+    const int64_t n_isects,
+    int32_t *__restrict__ ranges,
+    int32_t *__restrict__ bucket_count
+) {
+    // parallelize over I * N.
+    int64_t idx = cg::this_grid().thread_rank();
+    if (idx >= T) {
+        return;
+    }
+    int32_t range_start = ranges[idx];
+    int32_t range_end = (idx == T - 1) ? n_isects : ranges[idx + 1];
+
+    int32_t num_splats = range_end - range_start;
+    int32_t num_buckets = (num_splats + 31u) / 32u;
+    bucket_count[idx] = num_buckets;
+}
+
+void launch_bucket_count_kernel(
+    // inputs
+    at::Tensor tile_offsets,
+    int64_t n_elements,
+    int64_t n_isects,
+    // outputs
+    at::Tensor bucket_count
+) {
+    dim3 threads(256);
+    dim3 grid((n_elements + threads.x - 1) / threads.x);
+    int64_t shmem_size = 0; // No shared memory used in this kernel
+
+    bucket_count_kernel<<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
+        n_elements,
+        n_isects,
+        tile_offsets.data_ptr<int32_t>(),
+        bucket_count.data_ptr<int32_t>()
+    );
+}
+
 } // namespace gsplat

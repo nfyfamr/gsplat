@@ -2462,10 +2462,22 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
             render_colors,
             render_alphas,
             render_normals,
+            render_vis_wd,
+            render_w,
             render_distort,
             render_median,
             last_ids,
             median_ids,
+            per_tile_bucket_offset,
+            bucket_to_tile,
+            sampled_T,
+            sampled_ar,
+            sampled_an,
+            sampled_avd,
+            sampled_aw,
+            sampled_avwd,
+            max_contrib,
+            num_buckets,
         ) = _make_lazy_cuda_func("rasterize_to_pixels_2dgs_fwd")(
             means2d,
             ray_transforms,
@@ -2494,14 +2506,27 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
             flatten_ids,
             render_colors,
             render_alphas,
+            render_normals,
+            render_vis_wd,
+            render_w,
             last_ids,
             median_ids,
+            per_tile_bucket_offset,
+            bucket_to_tile,
+            sampled_T,
+            sampled_ar,
+            sampled_an,
+            sampled_avd,
+            sampled_aw,
+            sampled_avwd,
+            max_contrib,
         )
         ctx.width = width
         ctx.height = height
         ctx.tile_size = tile_size
         ctx.absgrad = absgrad
         ctx.distloss = distloss
+        ctx.num_buckets = num_buckets
 
         # double to float
         render_alphas = render_alphas.float()
@@ -2536,13 +2561,26 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
             flatten_ids,
             render_colors,
             render_alphas,
+            render_normals,
+            render_vis_wd,
+            render_w,
             last_ids,
             median_ids,
+            per_tile_bucket_offset,
+            bucket_to_tile,
+            sampled_T,
+            sampled_ar,
+            sampled_an,
+            sampled_avd,
+            sampled_aw,
+            sampled_avwd,
+            max_contrib,
         ) = ctx.saved_tensors
         width = ctx.width
         height = ctx.height
         tile_size = ctx.tile_size
         absgrad = ctx.absgrad
+        num_buckets = ctx.num_buckets
 
         (
             v_means2d_abs,
@@ -2568,8 +2606,21 @@ class _RasterizeToPixels2DGS(torch.autograd.Function):
             flatten_ids,
             render_colors,
             render_alphas,
+            render_normals,
+            render_vis_wd,
+            render_w,
             last_ids,
             median_ids,
+            num_buckets,
+            per_tile_bucket_offset,
+            bucket_to_tile,
+            sampled_T,
+            sampled_ar,
+            sampled_an,
+            sampled_avd,
+            sampled_aw,
+            sampled_avwd,
+            max_contrib,
             v_render_colors.contiguous(),
             v_render_alphas.contiguous(),
             v_render_normals.contiguous(),

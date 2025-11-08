@@ -116,10 +116,22 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
     // intersections
     const at::Tensor tile_offsets, // [..., tile_height, tile_width]
     const at::Tensor flatten_ids,  // [n_isects]
+    // efficient backward
+    const at::Tensor per_tile_bucket_offset,
+    at::Tensor bucket_to_tile,
+    at::Tensor sampled_T,
+    at::Tensor sampled_ar,
+    at::Tensor sampled_an,
+    at::Tensor sampled_avd,
+    at::Tensor sampled_aw,
+    at::Tensor sampled_avwd,
+    at::Tensor max_contrib,
     // outputs
     at::Tensor renders,        // [..., image_height, image_width, channels]
     at::Tensor alphas,         // [..., image_height, image_width, 1]
     at::Tensor render_normals, // [..., image_height, image_width, 3]
+    at::Tensor render_vis_wd, // [..., image_height, image_width, 1]
+    at::Tensor render_w,       // [..., image_height, image_width, 1]
     at::Tensor render_distort, // [..., image_height, image_width, 1]
     at::Tensor render_median,  // [..., image_height, image_width, 1]
     at::Tensor last_ids,       // [..., image_height, image_width]
@@ -146,8 +158,22 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
     // forward outputs
     const at::Tensor render_colors, // [..., image_height, image_width, CDIM]
     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
+    const at::Tensor render_normals, // [..., image_height, image_width, CDIM]
+    const at::Tensor render_vis_wd, // [..., image_height, image_width, 1]
+    const at::Tensor render_w,      // [..., image_height, image_width, 1]
     const at::Tensor last_ids,      // [..., image_height, image_width]
     const at::Tensor median_ids,    // [..., image_height, image_width]
+    // efficient backward
+    const uint32_t num_buckets,
+    const at::Tensor per_tile_bucket_offset,
+    const at::Tensor bucket_to_tile,
+    const at::Tensor sampled_T,
+    const at::Tensor sampled_ar,
+    const at::Tensor sampled_an,
+    const at::Tensor sampled_avd,
+    const at::Tensor sampled_aw,
+    const at::Tensor sampled_avwd,
+    const at::Tensor max_contrib,
     // gradients of outputs
     const at::Tensor v_render_colors,  // [..., image_height, image_width, 3]
     const at::Tensor v_render_alphas,  // [..., image_height, image_width, 1]
@@ -273,5 +299,7 @@ void launch_rasterize_to_pixels_from_world_3dgs_bwd_kernel(
     at::Tensor v_colors,     // [..., C, N, 3] or [nnz, 3]
     at::Tensor v_opacities   // [..., C, N] or [nnz]
 ) ;
+
+void debug_tensor_values(const at::Tensor& t, int i0 = -1, int i1 = -1, int i2 = -1, int i3 = -1);
 
 } // namespace gsplat

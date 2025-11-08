@@ -10,6 +10,11 @@
 #include "Ops.h"
 #include "Rasterization.h"
 #include "Cameras.h"
+#include "Intersect.h"
+#include <torch/torch.h>
+#include <iostream>
+#include <vector>
+#include <sstream>
 
 namespace gsplat {
 
@@ -316,6 +321,48 @@ std::tuple<at::Tensor, at::Tensor> rasterize_to_indices_3dgs(
 // 2DGS
 ////////////////////////////////////////////////////
 
+void debug_tensor_values(const at::Tensor& t, int i0, int i1, int i2, int i3) {
+    // Move to CPU for safe access
+    at::Tensor cpu_t = t.cpu().contiguous();
+    auto dtype = cpu_t.dtype();
+    auto sizes = cpu_t.sizes();
+    auto strides = cpu_t.strides();
+    int64_t ndim = cpu_t.dim();
+
+    // Collect provided indices
+    std::array<int64_t, 4> idxs = {i0, i1, i2, i3};
+
+    // Compute flat index
+    int64_t flat_index = 0;
+    for (int64_t d = 0; d < ndim && d < (int64_t)idxs.size(); ++d) {
+        if (idxs[d] < 0) break;  // stop when no more valid indices
+        if (idxs[d] >= sizes[d]) {
+            std::cerr << "❌ Index " << idxs[d]
+                      << " out of range for dim " << d
+                      << " (size=" << sizes[d] << ")" << std::endl;
+            return;
+        }
+        flat_index += idxs[d] * strides[d];
+    }
+
+    // Print the value at that index
+    if (dtype == torch::kFloat32) {
+        auto ptr = cpu_t.data_ptr<float>();
+        std::cout << "  value = " << ptr[flat_index] << std::endl;
+    } else if (dtype == torch::kFloat64) {
+        auto ptr = cpu_t.data_ptr<double>();
+        std::cout << "  value = " << ptr[flat_index] << std::endl;
+    } else if (dtype == torch::kInt32) {
+        auto ptr = cpu_t.data_ptr<int32_t>();
+        std::cout << "  value = " << ptr[flat_index] << std::endl;
+    } else if (dtype == torch::kInt64) {
+        auto ptr = cpu_t.data_ptr<int64_t>();
+        std::cout << "  value = " << ptr[flat_index] << std::endl;
+    } else {
+        std::cout << "  [unsupported dtype: " << dtype << "]" << std::endl;
+    }
+}
+
 std::tuple<
     at::Tensor,
     at::Tensor,
@@ -323,7 +370,19 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
-    at::Tensor>
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    int64_t>
 rasterize_to_pixels_2dgs_fwd(
     // Gaussian parameters
     const at::Tensor means2d,        // [..., N, 2] or [nnz, 2]
@@ -380,6 +439,14 @@ rasterize_to_pixels_2dgs_fwd(
     render_normals_dims.append({image_height, image_width, 3});
     at::Tensor render_normals = at::empty(render_normals_dims, opt);
 
+    at::DimVector render_vis_wd_dims(image_dims);
+    render_vis_wd_dims.append({image_height, image_width, 1});
+    at::Tensor render_vis_wd = at::empty(render_vis_wd_dims, opt);
+    
+    at::DimVector render_w_dims(image_dims);
+    render_w_dims.append({image_height, image_width, 1});
+    at::Tensor render_w = at::empty(render_w_dims, opt);
+    
     at::DimVector render_distort_dims(image_dims);
     render_distort_dims.append({image_height, image_width, 1});
     at::Tensor render_distort = at::empty(render_distort_dims, opt);
@@ -387,6 +454,56 @@ rasterize_to_pixels_2dgs_fwd(
     at::DimVector render_median_dims(image_dims);
     render_median_dims.append({image_height, image_width, 1});
     at::Tensor render_median = at::empty(render_median_dims, opt);
+
+    // bucket count
+    const int64_t I = tile_offsets.size(0);
+    const int64_t tile_height = tile_offsets.size(1);
+    const int64_t tile_width = tile_offsets.size(2);
+
+    int64_t n_tiles = tile_height * tile_width;
+    int64_t n_elements = I * n_tiles;
+    int64_t n_isects = flatten_ids.size(0);
+    int32_t block_size = tile_size * tile_size * 1;
+
+    at::DimVector bucket_count_dims(image_dims);
+    bucket_count_dims.append({tile_height, tile_width});
+    at::Tensor bucket_count = at::empty(bucket_count_dims, opt.dtype(at::kInt));
+
+    launch_bucket_count_kernel(tile_offsets, n_elements, n_isects, bucket_count);
+    at::Tensor per_tile_bucket_offset = at::cumsum(bucket_count.flatten(), 0, bucket_count.scalar_type());
+	int64_t bucket_sum = per_tile_bucket_offset[-1].item<int64_t>();
+
+    at::DimVector bucket_to_tile_dims(image_dims);
+    bucket_to_tile_dims.append({bucket_sum, block_size});
+    at::Tensor bucket_to_tile = at::empty(bucket_to_tile_dims, opt.dtype(at::kInt));
+
+    at::DimVector sampled_T_dims(image_dims);
+    sampled_T_dims.append({bucket_sum, block_size});
+    at::Tensor sampled_T = at::empty(sampled_T_dims, opt);
+
+    at::DimVector sampled_ar_dims(image_dims);
+    sampled_ar_dims.append({bucket_sum, block_size, channels});
+    at::Tensor sampled_ar = at::empty(sampled_ar_dims, opt);
+
+    at::DimVector sampled_an_dims(image_dims);
+    sampled_an_dims.append({bucket_sum, block_size, 3});
+    at::Tensor sampled_an = at::empty(sampled_an_dims, opt);
+
+    at::DimVector sampled_avd_dims(image_dims);
+    sampled_avd_dims.append({bucket_sum, block_size});
+    at::Tensor sampled_avd = at::empty(sampled_avd_dims, opt);
+    
+    at::DimVector sampled_aw_dims(image_dims);
+    sampled_aw_dims.append({bucket_sum, block_size});
+    at::Tensor sampled_aw = at::empty(sampled_aw_dims, opt);
+    
+    at::DimVector sampled_avwd_dims(image_dims);
+    sampled_avwd_dims.append({bucket_sum, block_size});
+    at::Tensor sampled_avwd = at::empty(sampled_avwd_dims, opt);
+
+    at::DimVector max_contrib_dims(image_dims);
+    max_contrib_dims.append({tile_height, tile_width});
+    at::Tensor max_contrib = at::empty(max_contrib_dims, opt.dtype(at::kInt));
 
 #define __LAUNCH_KERNEL__(N)                                                   \
     case N:                                                                    \
@@ -403,9 +520,20 @@ rasterize_to_pixels_2dgs_fwd(
             tile_size,                                                         \
             tile_offsets,                                                      \
             flatten_ids,                                                       \
+            per_tile_bucket_offset,                                            \
+            bucket_to_tile,                                                    \
+            sampled_T,                                                         \
+            sampled_ar,                                                        \
+            sampled_an,                                                        \
+            sampled_avd,                                                       \
+            sampled_aw,                                                        \
+            sampled_avwd,                                                      \
+            max_contrib,                                                       \
             renders,                                                           \
             alphas,                                                            \
             render_normals,                                                    \
+            render_vis_wd,                                                     \
+            render_w,                                                          \
             render_distort,                                                    \
             render_median,                                                     \
             last_ids,                                                          \
@@ -445,10 +573,22 @@ rasterize_to_pixels_2dgs_fwd(
         renders,
         alphas,
         render_normals,
+        render_vis_wd,
+        render_w,
         render_distort,
         render_median,
         last_ids,
-        median_ids
+        median_ids,
+        per_tile_bucket_offset,
+        bucket_to_tile,
+        sampled_T,
+        sampled_ar,
+        sampled_an,
+        sampled_avd,
+        sampled_aw,
+        sampled_avwd,
+        max_contrib,
+        bucket_sum
     );
 }
 
@@ -480,8 +620,22 @@ rasterize_to_pixels_2dgs_bwd(
     // forward outputs
     const at::Tensor render_colors, // [..., image_height, image_width, channels]
     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
+    const at::Tensor render_normals, // [..., image_height, image_width, 3]
+    const at::Tensor render_vis_wd,  // [..., image_height, image_width, 1]
+    const at::Tensor render_w,       // [..., image_height, image_width, 1]
     const at::Tensor last_ids,      // [..., image_height, image_width]
     const at::Tensor median_ids,    // [..., image_height, image_width]
+    // efficient backward
+    const uint32_t num_buckets,
+    const at::Tensor per_tile_bucket_offset,
+    const at::Tensor bucket_to_tile,
+    const at::Tensor sampled_T,
+    const at::Tensor sampled_ar,
+    const at::Tensor sampled_an,
+    const at::Tensor sampled_avd,
+    const at::Tensor sampled_aw,
+    const at::Tensor sampled_avwd,
+    const at::Tensor max_contrib,
     // gradients of outputs
     const at::Tensor v_render_colors,  // [..., image_height, image_width, channels]
     const at::Tensor v_render_alphas,  // [..., image_height, image_width, 1]
@@ -502,6 +656,9 @@ rasterize_to_pixels_2dgs_bwd(
     CHECK_INPUT(flatten_ids);
     CHECK_INPUT(render_colors);
     CHECK_INPUT(render_alphas);
+    CHECK_INPUT(render_normals);
+    CHECK_INPUT(render_vis_wd);
+    CHECK_INPUT(render_w);
     CHECK_INPUT(last_ids);
     CHECK_INPUT(median_ids);
     CHECK_INPUT(v_render_colors);
@@ -547,8 +704,21 @@ rasterize_to_pixels_2dgs_bwd(
             flatten_ids,                                                       \
             render_colors,                                                     \
             render_alphas,                                                     \
+            render_normals,                                                    \
+            render_vis_wd,                                                     \
+            render_w,                                                          \
             last_ids,                                                          \
             median_ids,                                                        \
+            num_buckets,                                                       \
+            per_tile_bucket_offset,                                            \
+            bucket_to_tile,                                                    \
+            sampled_T,                                                         \
+            sampled_ar,                                                        \
+            sampled_an,                                                        \
+            sampled_avd,                                                       \
+            sampled_aw,                                                        \
+            sampled_avwd,                                                      \
+            max_contrib,                                                       \
             v_render_colors,                                                   \
             v_render_alphas,                                                   \
             v_render_normals,                                                  \

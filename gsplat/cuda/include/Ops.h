@@ -384,7 +384,19 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
-    at::Tensor>
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    at::Tensor,
+    int64_t>
 rasterize_to_pixels_2dgs_fwd(
     // Gaussian parameters
     const at::Tensor means2d,        // [..., N, 2] or [nnz, 2]
@@ -430,8 +442,22 @@ rasterize_to_pixels_2dgs_bwd(
     // forward outputs
     const at::Tensor render_colors, // [..., image_height, image_width, COLOR_DIM]
     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
+    const at::Tensor render_normals, // [..., image_height, image_width, 3]
+    const at::Tensor render_vis_wd,  // [..., image_height, image_width, 1]
+    const at::Tensor render_w,  // [..., image_height, image_width, 1]
     const at::Tensor last_ids,      // [..., image_height, image_width]
     const at::Tensor median_ids,    // [..., image_height, image_width]
+    // efficient backward
+    const uint32_t num_buckets,
+    const at::Tensor per_tile_bucket_offset,
+    const at::Tensor bucket_to_tile,
+    const at::Tensor sampled_T,
+    const at::Tensor sampled_ar,
+    const at::Tensor sampled_an,
+    const at::Tensor sampled_avd,
+    const at::Tensor sampled_aw,
+    const at::Tensor sampled_avwd,
+    const at::Tensor max_contrib,
     // gradients of outputs
     const at::Tensor v_render_colors,  // [..., image_height, image_width, 3]
     const at::Tensor v_render_alphas,  // [..., image_height, image_width, 1]

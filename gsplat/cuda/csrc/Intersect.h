@@ -58,4 +58,13 @@ void segmented_radix_sort_double_buffer(
     at::Tensor flatten_ids_sorted
 );
 
+void launch_bucket_count_kernel(
+    // inputs
+    at::Tensor tile_offsets,
+    int64_t n_elements,
+    int64_t n_isects,
+    // outputs
+    at::Tensor bucket_count
+);
+
 } // namespace gsplat
