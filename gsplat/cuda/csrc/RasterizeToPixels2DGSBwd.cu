@@ -267,11 +267,13 @@ __global__ void per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel(
     float *T_final_batch = (float *)&sampled_stat_batch[BLOCK_SIZE/batch_factor];  // [BLOCK_SIZE/batch_factor]
     float *v_render_a_batch = &T_final_batch[BLOCK_SIZE/batch_factor];  // [BLOCK_SIZE/batch_factor]
     float *last_contributor_batch = &v_render_a_batch[BLOCK_SIZE/batch_factor];  // [BLOCK_SIZE/batch_factor]
-    float *render_colors_batch = &last_contributor_batch[BLOCK_SIZE/batch_factor];  // [BLOCK_SIZE/batch_factor * CDIM]
-    float *sampled_ar_batch = &render_colors_batch[BLOCK_SIZE/batch_factor * CDIM];  // [BLOCK_SIZE/batch_factor * CDIM]
-    float *v_render_colors_batch = &sampled_ar_batch[BLOCK_SIZE/batch_factor * CDIM];  // [BLOCK_SIZE/batch_factor * CDIM]
+    float4 *render_colors_batch = 
+        reinterpret_cast<float4 *>(&last_contributor_batch[BLOCK_SIZE/batch_factor]);  // [BLOCK_SIZE/batch_factor]
+    float *sampled_ar_batch = (float *)&render_colors_batch[BLOCK_SIZE/batch_factor];  // [BLOCK_SIZE/batch_factor * CDIM]
+    float4 *v_render_colors_batch = 
+        reinterpret_cast<float4 *>(&sampled_ar_batch[BLOCK_SIZE/batch_factor * CDIM]);  // [BLOCK_SIZE/batch_factor]
     float3 *sampled_an_batch = 
-        reinterpret_cast<float3 *>(&v_render_colors_batch[BLOCK_SIZE/batch_factor * CDIM]);  // [BLOCK_SIZE/batch_factor]
+        reinterpret_cast<float3 *>(&v_render_colors_batch[BLOCK_SIZE/batch_factor]);  // [BLOCK_SIZE/batch_factor]
     float *render_normals_batch = (float *)&sampled_an_batch[BLOCK_SIZE/batch_factor];  // [BLOCK_SIZE/batch_factor * 3]
     float *v_render_normals_batch = &render_normals_batch[BLOCK_SIZE/batch_factor * 3];  // [BLOCK_SIZE/batch_factor * 3]
     float *v_render_distort_batch = nullptr;
@@ -304,12 +306,16 @@ __global__ void per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel(
                 v_render_a_batch[idx] = v_render_alphas[pix_id];
                 last_contributor_batch[idx] = last_ids[pix_id];
 
+                float4* render_colors_ptr = (float4*)render_colors;
+                render_colors_batch[idx] = render_colors_ptr[pix_id];
+                float4* v_render_colors_ptr = (float4*)v_render_colors;
+                v_render_colors_batch[idx] = v_render_colors_ptr[pix_id];
     #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
-                    render_colors_batch[idx * CDIM + k] = render_colors[pix_id * CDIM + k];
+                    // render_colors_batch[idx * CDIM + k] = render_colors[pix_id * CDIM + k];
                     sampled_ar_batch[idx * CDIM + k] = 
                         sampled_ar[global_bucket_idx * BLOCK_SIZE * CDIM + k * BLOCK_SIZE + (idx + BLOCK_SIZE/batch_factor*bch)] + (backgrounds == nullptr ? 0 : T_final_batch[idx] * backgrounds[k]);
-                    v_render_colors_batch[idx * CDIM + k] = v_render_colors[pix_id * CDIM + k];
+                    // v_render_colors_batch[idx * CDIM + k] = v_render_colors[pix_id * CDIM + k];
                 }
 
                 float4* sampled_an_ptr = (float4*) sampled_an;
@@ -332,7 +338,7 @@ __global__ void per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel(
         block.sync();
 
         // loop over all batches of primitives
-        for (; inner_i < BLOCK_SIZE + 31; ++inner_i) {
+        for (; inner_i < BLOCK_SIZE/batch_factor*(bch+1) + (bch+1==batch_factor ? 31 : 0); ++inner_i) {
             // SHUFFLING
 
             // At this point, T already has my (1 - alpha) multiplied.
@@ -363,14 +369,15 @@ __global__ void per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel(
             }
 
             // which pixel index should this thread deal with?
-            int idx = inner_i - BLOCK_SIZE/batch_factor*bch - my_warp.thread_rank();        // pix index in tile.
-            const uint2 pix = {pix_min.x + (idx + BLOCK_SIZE/batch_factor*bch) % tile_size, pix_min.y + (idx + BLOCK_SIZE/batch_factor*bch) / tile_size};
-            // const uint32_t pix_id = image_width * pix.y + pix.x;
+            int idx = inner_i - my_warp.thread_rank();        // pix index in tile.
+            const uint2 pix = {pix_min.x + (idx) % tile_size, pix_min.y + (idx) / tile_size};
+            const uint32_t pix_id = image_width * pix.y + pix.x;
             const float2 pixf = {(float) pix.x + 0.5f, (float) pix.y + 0.5f};
             bool valid_pixel = pix.x < image_width && pix.y < image_height;
             
             // every 32nd thread should read the stored state from memory
-            if (valid_splat && valid_pixel && my_warp.thread_rank() == 0 && idx < BLOCK_SIZE/batch_factor) {
+            if (valid_splat && valid_pixel && my_warp.thread_rank() == 0 && idx < BLOCK_SIZE) {
+                idx -= BLOCK_SIZE/batch_factor*bch;
                 median_idx = median_id_batch[idx];
                 v_median = v_median_batch[idx];
                 float4 sampled_stat = sampled_stat_batch[idx];      // (sampled_T, sampled_avd, sampled_aw, sampled_avwd)
@@ -378,11 +385,19 @@ __global__ void per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel(
                 T_final = T_final_batch[idx];
                 v_render_a = v_render_a_batch[idx];
                 last_contributor = last_contributor_batch[idx];
-    #pragma unroll
-                for (int k = 0; k < CDIM; ++k) {
-                    ar[k] = -render_colors_batch[idx * CDIM + k] + sampled_ar_batch[idx * CDIM + k];
-                    dL_dpixel[k] = v_render_colors_batch[idx * CDIM + k];
-                }
+    // #pragma unroll
+                // for (int k = 0; k < CDIM; ++k) {
+                //     ar[k] = -render_colors_batch[idx * CDIM + k] + sampled_ar_batch[idx * CDIM + k];
+                //     dL_dpixel[k] = v_render_colors_batch[idx * CDIM + k];
+                // }
+                ar[0] = -render_colors_batch[idx].x + sampled_ar_batch[idx * CDIM + 0];
+                ar[1] = -render_colors_batch[idx].y + sampled_ar_batch[idx * CDIM + 1];
+                ar[2] = -render_colors_batch[idx].z + sampled_ar_batch[idx * CDIM + 2];
+                ar[3] = -render_colors_batch[idx].w + sampled_ar_batch[idx * CDIM + 3];
+                dL_dpixel[0] = v_render_colors_batch[idx].x;
+                dL_dpixel[1] = v_render_colors_batch[idx].y;
+                dL_dpixel[2] = v_render_colors_batch[idx].z;
+                dL_dpixel[3] = v_render_colors_batch[idx].w;
                 float3 an_tmp = sampled_an_batch[idx];
                 float nx = render_normals_batch[idx * 3];
                 float ny = render_normals_batch[idx * 3 + 1];
@@ -399,15 +414,16 @@ __global__ void per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel(
                     float2 render_stat = render_stat_batch[idx];     // (vis_wd, w)
                     vis_wd_final = render_stat.x;
                     w_final = render_stat.y;
-                    d_final = render_colors_batch[idx * CDIM + CDIM - 1];
+                    d_final = render_colors_batch[idx].w;
                     accum_d = sampled_stat.y;
                     accum_w = sampled_stat.z;
                     accum_vis_wd = sampled_stat.w;
                 }
+                idx += BLOCK_SIZE/batch_factor*bch;
             }
 
             // do work
-            if (valid_splat && valid_pixel && 0 <= idx && idx < BLOCK_SIZE/batch_factor) {
+            if (valid_splat && valid_pixel && 0 <= idx && idx < BLOCK_SIZE) {
                 if (image_width <= pix.x || image_height <= pix.y) continue;
 
                 if (splat_idx_global > last_contributor) continue;
@@ -1591,7 +1607,7 @@ void tensor_diff_check(const at::Tensor& a, const at::Tensor& b, float atol) {
 //     // if (!b0 || !b1 || !b2 || !b3 || !b4 || !b5 || !b6) {
 //     //     printf("v_means2d_abs %d, v_means2d %d, v_ray_transforms %d, v_colors %d, v_opacities %d, v_normals %d, v_densify %d \n",
 //     //         b0, b1, b2, b3, b4, b5, b6);
-//     //     printf("detect diff!");
+//     //     printf("detect diff!\n");
 //     //     if (!b0) tensor_diff_check(copy_v_means2d_abs, v_means2d_abs.value(), TOLERANCE);
 //     //     if (!b1) tensor_diff_check(copy_v_means2d, v_means2d, TOLERANCE);
 //     //     if (!b2) tensor_diff_check(copy_v_ray_transforms, v_ray_transforms, TOLERANCE);
