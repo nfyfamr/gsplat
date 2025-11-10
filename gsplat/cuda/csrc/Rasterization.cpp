@@ -378,10 +378,6 @@ std::tuple<
     at::Tensor,
     at::Tensor,
     at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
-    at::Tensor,
     int64_t>
 rasterize_to_pixels_2dgs_fwd(
     // Gaussian parameters
@@ -439,13 +435,9 @@ rasterize_to_pixels_2dgs_fwd(
     render_normals_dims.append({image_height, image_width, 3});
     at::Tensor render_normals = at::empty(render_normals_dims, opt);
 
-    at::DimVector render_vis_wd_dims(image_dims);
-    render_vis_wd_dims.append({image_height, image_width, 1});
-    at::Tensor render_vis_wd = at::empty(render_vis_wd_dims, opt);
-    
-    at::DimVector render_w_dims(image_dims);
-    render_w_dims.append({image_height, image_width, 1});
-    at::Tensor render_w = at::empty(render_w_dims, opt);
+    at::DimVector render_stats_dims(image_dims);
+    render_stats_dims.append({image_height, image_width, 2});
+    at::Tensor render_stats = at::empty(render_stats_dims, opt);
     
     at::DimVector render_distort_dims(image_dims);
     render_distort_dims.append({image_height, image_width, 1});
@@ -477,29 +469,21 @@ rasterize_to_pixels_2dgs_fwd(
     bucket_to_tile_dims.append({bucket_sum, block_size});
     at::Tensor bucket_to_tile = at::empty(bucket_to_tile_dims, opt.dtype(at::kInt));
 
-    at::DimVector sampled_T_dims(image_dims);
-    sampled_T_dims.append({bucket_sum, block_size});
-    at::Tensor sampled_T = at::empty(sampled_T_dims, opt);
+    at::DimVector sampled_stats_dims(image_dims);
+    sampled_stats_dims.append({bucket_sum, block_size, 4});
+    at::Tensor sampled_stats = at::empty(sampled_stats_dims, opt);
 
     at::DimVector sampled_ar_dims(image_dims);
     sampled_ar_dims.append({bucket_sum, block_size, channels});
     at::Tensor sampled_ar = at::empty(sampled_ar_dims, opt);
 
     at::DimVector sampled_an_dims(image_dims);
-    sampled_an_dims.append({bucket_sum, block_size, 3});
+    sampled_an_dims.append({bucket_sum, block_size, 4});
     at::Tensor sampled_an = at::empty(sampled_an_dims, opt);
 
-    at::DimVector sampled_avd_dims(image_dims);
-    sampled_avd_dims.append({bucket_sum, block_size});
-    at::Tensor sampled_avd = at::empty(sampled_avd_dims, opt);
-    
-    at::DimVector sampled_aw_dims(image_dims);
-    sampled_aw_dims.append({bucket_sum, block_size});
-    at::Tensor sampled_aw = at::empty(sampled_aw_dims, opt);
-    
-    at::DimVector sampled_avwd_dims(image_dims);
-    sampled_avwd_dims.append({bucket_sum, block_size});
-    at::Tensor sampled_avwd = at::empty(sampled_avwd_dims, opt);
+    // at::DimVector sampled_an_bucket_to_tile_dims(image_dims);       // (n0, n1, n2, tild_id)
+    // sampled_an_bucket_to_tile_dims.append({bucket_sum, block_size, 4});
+    // at::Tensor sampled_an_bucket_to_tile = at::empty(sampled_an_bucket_to_tile_dims, opt);
 
     at::DimVector max_contrib_dims(image_dims);
     max_contrib_dims.append({tile_height, tile_width});
@@ -522,18 +506,14 @@ rasterize_to_pixels_2dgs_fwd(
             flatten_ids,                                                       \
             per_tile_bucket_offset,                                            \
             bucket_to_tile,                                                    \
-            sampled_T,                                                         \
+            sampled_stats,                                                         \
             sampled_ar,                                                        \
             sampled_an,                                                        \
-            sampled_avd,                                                       \
-            sampled_aw,                                                        \
-            sampled_avwd,                                                      \
             max_contrib,                                                       \
             renders,                                                           \
             alphas,                                                            \
             render_normals,                                                    \
-            render_vis_wd,                                                     \
-            render_w,                                                          \
+            render_stats,                                                     \
             render_distort,                                                    \
             render_median,                                                     \
             last_ids,                                                          \
@@ -573,20 +553,16 @@ rasterize_to_pixels_2dgs_fwd(
         renders,
         alphas,
         render_normals,
-        render_vis_wd,
-        render_w,
+        render_stats,
         render_distort,
         render_median,
         last_ids,
         median_ids,
         per_tile_bucket_offset,
         bucket_to_tile,
-        sampled_T,
+        sampled_stats,
         sampled_ar,
         sampled_an,
-        sampled_avd,
-        sampled_aw,
-        sampled_avwd,
         max_contrib,
         bucket_sum
     );
@@ -621,20 +597,16 @@ rasterize_to_pixels_2dgs_bwd(
     const at::Tensor render_colors, // [..., image_height, image_width, channels]
     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
     const at::Tensor render_normals, // [..., image_height, image_width, 3]
-    const at::Tensor render_vis_wd,  // [..., image_height, image_width, 1]
-    const at::Tensor render_w,       // [..., image_height, image_width, 1]
+    const at::Tensor render_stats,  // [..., image_height, image_width, 2]
     const at::Tensor last_ids,      // [..., image_height, image_width]
     const at::Tensor median_ids,    // [..., image_height, image_width]
     // efficient backward
     const uint32_t num_buckets,
     const at::Tensor per_tile_bucket_offset,
     const at::Tensor bucket_to_tile,
-    const at::Tensor sampled_T,
+    const at::Tensor sampled_stats,
     const at::Tensor sampled_ar,
     const at::Tensor sampled_an,
-    const at::Tensor sampled_avd,
-    const at::Tensor sampled_aw,
-    const at::Tensor sampled_avwd,
     const at::Tensor max_contrib,
     // gradients of outputs
     const at::Tensor v_render_colors,  // [..., image_height, image_width, channels]
@@ -657,8 +629,7 @@ rasterize_to_pixels_2dgs_bwd(
     CHECK_INPUT(render_colors);
     CHECK_INPUT(render_alphas);
     CHECK_INPUT(render_normals);
-    CHECK_INPUT(render_vis_wd);
-    CHECK_INPUT(render_w);
+    CHECK_INPUT(render_stats);
     CHECK_INPUT(last_ids);
     CHECK_INPUT(median_ids);
     CHECK_INPUT(v_render_colors);
@@ -705,19 +676,15 @@ rasterize_to_pixels_2dgs_bwd(
             render_colors,                                                     \
             render_alphas,                                                     \
             render_normals,                                                    \
-            render_vis_wd,                                                     \
-            render_w,                                                          \
+            render_stats,                                                      \
             last_ids,                                                          \
             median_ids,                                                        \
             num_buckets,                                                       \
             per_tile_bucket_offset,                                            \
             bucket_to_tile,                                                    \
-            sampled_T,                                                         \
+            sampled_stats,                                                     \
             sampled_ar,                                                        \
             sampled_an,                                                        \
-            sampled_avd,                                                       \
-            sampled_aw,                                                        \
-            sampled_avwd,                                                      \
             max_contrib,                                                       \
             v_render_colors,                                                   \
             v_render_alphas,                                                   \

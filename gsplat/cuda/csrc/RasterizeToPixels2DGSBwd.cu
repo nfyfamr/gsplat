@@ -74,9 +74,7 @@ __global__ void per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel(
     const scalar_t *__restrict__ render_normals, // [..., image_height,
                                                 // image_width, 3]
     const scalar_t
-        *__restrict__ render_vis_wd, // [..., image_height, image_width, 1]
-    const scalar_t
-        *__restrict__ render_w, // [..., image_height, image_width, 1]
+        *__restrict__ render_stats, // [..., image_height, image_width, 2]
     const int32_t
         *__restrict__ last_ids, // [..., image_height, image_width]     // the id
                                 // to last gaussian that got intersected
@@ -88,12 +86,9 @@ __global__ void per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel(
     const uint32_t num_buckets,
     const int32_t *__restrict__ per_tile_bucket_offset,
     const int32_t *__restrict__ bucket_to_tile,
-    const scalar_t *__restrict__ sampled_T,
+    const scalar_t *__restrict__ sampled_stats,
     const scalar_t *__restrict__ sampled_ar,
     const scalar_t *__restrict__ sampled_an,
-    const scalar_t *__restrict__ sampled_avd,
-    const scalar_t *__restrict__ sampled_aw,
-    const scalar_t *__restrict__ sampled_avwd,
     const int32_t *__restrict__ max_contrib,
 
     // grad outputs
@@ -212,6 +207,12 @@ __global__ void per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel(
             ray_transforms[gaussian_idx * 9 + 7],
             ray_transforms[gaussian_idx * 9 + 8]
         };
+        // float *ray_transforms_ptr = (float *)(ray_transforms) + gaussian_idx * 9;
+        // float4 row1_2_part = *(const float4*) (ray_transforms_ptr);        // Loads M11, M12, M13, M21
+        // float4 row2_3_part = *(const float4*) (ray_transforms_ptr + 4);    // Loads M22, M23, M31, M32
+        // u_M = {row1_2_part.x, row1_2_part.y, row1_2_part.z};
+        // v_M = {row1_2_part.w, row2_3_part.x, row2_3_part.y};
+        // w_M = {row2_3_part.z, row2_3_part.w, ray_transforms_ptr[8]};
 #pragma unroll
         for (uint32_t k = 0; k < CDIM; ++k) {
             color[k] = colors[gaussian_idx * CDIM + k];
@@ -255,245 +256,327 @@ __global__ void per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel(
 	// const float ddely_dy = 0.5 * image_height;
 
     const uint32_t BLOCK_SIZE = tile_size * tile_size;
+    const int32_t tr = my_warp.thread_rank();
+    const int32_t batch_factor = 8;
 
-    // loop over all batches of primitives
-    for (uint32_t i = 0; i < BLOCK_SIZE + 31; ++i) {
-        // SHUFFLING
+    extern __shared__ int s[];
+    int32_t *median_id_batch = (int32_t *)s; // [BLOCK_SIZE/batch_factor]
+    float *v_median_batch = (float *)&median_id_batch[BLOCK_SIZE/batch_factor]; // [BLOCK_SIZE/batch_factor]
+    float4 *sampled_stat_batch =
+        reinterpret_cast<float4 *>(&v_median_batch[BLOCK_SIZE/batch_factor]); // [BLOCK_SIZE/batch_factor]
+    float *T_final_batch = (float *)&sampled_stat_batch[BLOCK_SIZE/batch_factor];  // [BLOCK_SIZE/batch_factor]
+    float *v_render_a_batch = &T_final_batch[BLOCK_SIZE/batch_factor];  // [BLOCK_SIZE/batch_factor]
+    float *last_contributor_batch = &v_render_a_batch[BLOCK_SIZE/batch_factor];  // [BLOCK_SIZE/batch_factor]
+    float *render_colors_batch = &last_contributor_batch[BLOCK_SIZE/batch_factor];  // [BLOCK_SIZE/batch_factor * CDIM]
+    float *sampled_ar_batch = &render_colors_batch[BLOCK_SIZE/batch_factor * CDIM];  // [BLOCK_SIZE/batch_factor * CDIM]
+    float *v_render_colors_batch = &sampled_ar_batch[BLOCK_SIZE/batch_factor * CDIM];  // [BLOCK_SIZE/batch_factor * CDIM]
+    float3 *sampled_an_batch = 
+        reinterpret_cast<float3 *>(&v_render_colors_batch[BLOCK_SIZE/batch_factor * CDIM]);  // [BLOCK_SIZE/batch_factor]
+    float *render_normals_batch = (float *)&sampled_an_batch[BLOCK_SIZE/batch_factor];  // [BLOCK_SIZE/batch_factor * 3]
+    float *v_render_normals_batch = &render_normals_batch[BLOCK_SIZE/batch_factor * 3];  // [BLOCK_SIZE/batch_factor * 3]
+    float *v_render_distort_batch = nullptr;
+    float2 *render_stat_batch = nullptr;
+    if (v_render_distort != nullptr) {
+        v_render_distort_batch = &v_render_normals_batch[BLOCK_SIZE/batch_factor * 3];  // [BLOCK_SIZE/batch_factor]
+        render_stat_batch = 
+            reinterpret_cast<float2 *>(&v_render_distort_batch[BLOCK_SIZE/batch_factor]);  // [BLOCK_SIZE/batch_factor]
+    }
 
-		// At this point, T already has my (1 - alpha) multiplied.
-		// So pass this ready-made T value to next thread.
-		median_idx = my_warp.shfl_up(median_idx, 1);
-		v_median = my_warp.shfl_up(v_median, 1);
-		T = my_warp.shfl_up(T, 1);
-		last_contributor = my_warp.shfl_up(last_contributor, 1);
-		T_final = my_warp.shfl_up(T_final, 1);
-#pragma unroll
-        for (int k = 0; k < CDIM; ++k) {
-			ar[k] = my_warp.shfl_up(ar[k], 1);
-			dL_dpixel[k] = my_warp.shfl_up(dL_dpixel[k], 1);
-		}
-#pragma unroll
-        for (int k = 0; k < 3; ++k) {
-			an[k] = my_warp.shfl_up(an[k], 1);
-			dL_dnpixel[k] = my_warp.shfl_up(dL_dnpixel[k], 1);
-        }
-        if (v_render_distort != nullptr) {
-            v_distort = my_warp.shfl_up(v_distort, 1);
-            vis_wd_final = my_warp.shfl_up(vis_wd_final, 1);
-            d_final = my_warp.shfl_up(d_final, 1);
-            w_final = my_warp.shfl_up(w_final, 1);
-            accum_d = my_warp.shfl_up(accum_d, 1);
-            accum_w = my_warp.shfl_up(accum_w, 1);
-            accum_vis_wd = my_warp.shfl_up(accum_vis_wd, 1);
-        }
-
-		// which pixel index should this thread deal with?
-		int idx = i - my_warp.thread_rank();        // pix index in tile.
-		const uint2 pix = {pix_min.x + idx % tile_size, pix_min.y + idx / tile_size};
-		const uint32_t pix_id = image_width * pix.y + pix.x;
-		const float2 pixf = {(float) pix.x + 0.5f, (float) pix.y + 0.5f};
-		bool valid_pixel = pix.x < image_width && pix.y < image_height;
-		
-		// every 32nd thread should read the stored state from memory
-		// TODO: perhaps store these things in shared memory?
-		if (valid_splat && valid_pixel && my_warp.thread_rank() == 0 && idx < BLOCK_SIZE) {
-            median_idx = median_ids[pix_id];
-            v_median = v_render_median[pix_id];
-			T = sampled_T[global_bucket_idx * BLOCK_SIZE + idx];
-			T_final = 1 - render_alphas[pix_id];
-            v_render_a = v_render_alphas[pix_id];
-			last_contributor = last_ids[pix_id];
-#pragma unroll
-			for (int k = 0; k < CDIM; ++k) {
-				ar[k] = -render_colors[pix_id * CDIM + k] + sampled_ar[global_bucket_idx * BLOCK_SIZE * CDIM + k * BLOCK_SIZE + idx] + (backgrounds == nullptr ? 0 : T_final * backgrounds[k]);
-				dL_dpixel[k] = v_render_colors[pix_id * CDIM + k];
-            }
-#pragma unroll
-            for (int k = 0; k < 3; ++k) {
-                an[k] = -render_normals[pix_id * 3 + k] + sampled_an[global_bucket_idx * BLOCK_SIZE * 3 + k * BLOCK_SIZE + idx];
-				dL_dnpixel[k] = v_render_normals[pix_id * 3 + k];
-            }
-            if (v_render_distort != nullptr) {
-                v_distort = v_render_distort[pix_id];
-                vis_wd_final = render_vis_wd[pix_id];
-                d_final = render_colors[pix_id * CDIM + CDIM - 1];
-                w_final = render_w[pix_id];
-                accum_d = sampled_avd[global_bucket_idx * BLOCK_SIZE + idx];
-                accum_w = sampled_aw[global_bucket_idx * BLOCK_SIZE + idx];
-                accum_vis_wd = sampled_avwd[global_bucket_idx * BLOCK_SIZE + idx];
-            }
-		}
-
-		// do work
-		if (valid_splat && valid_pixel && 0 <= idx && idx < BLOCK_SIZE) {
-			if (image_width <= pix.x || image_height <= pix.y) continue;
-
-			if (splat_idx_global > last_contributor) continue;
-
-            vec3 h_u = pixf.x * w_M - u_M;
-            vec3 h_v = pixf.y * w_M - v_M;
-            vec3 ray_cross = glm::cross(h_u, h_v);
-
-            // no ray_crossion
-            if (ray_cross.z == 0.0) continue;
-
-            vec2 s = {ray_cross.x / ray_cross.z, ray_cross.y / ray_cross.z};
-
-            // GAUSSIAN KERNEL EVALUATION
-            float gauss_weight_3d = s.x * s.x + s.y * s.y;
-            vec2 d = {xy.x - pixf.x, xy.y - pixf.y};
-
-            // 2D gaussian weight using the projected 2D mean
-            float gauss_weight_2d =
-                FILTER_INV_SQUARE_2DGS * (d.x * d.x + d.y * d.y);
-            float gauss_weight = min(gauss_weight_3d, gauss_weight_2d);
-
-            // visibility and alpha
-            const float sigma = 0.5f * gauss_weight;
-            float vis = __expf(-sigma);
-            float alpha = min(0.999f, opac * vis); // clipped alpha
-
-            // gaussian throw out
-            if (sigma < 0.f || alpha < ALPHA_THRESHOLD) continue;
-
-            // gradient contribution from median depth
-            if (splat_idx_global == median_idx) {
-                // v_median is a special gradient input from forward pass
-                // not yet clear what this is for
-                Register_dL_dcolors[CDIM - 1] += v_median;
-            }
-
-            /**
-                * d(img)/d(rgb) and d(img)/d(alpha)
-                */
-
-            // compute the current T for this gaussian
-            // since the output T = coprod (1 - alpha_i), we have T_(i-1) =
-            // T_i * 1/(1 - alpha_(i-1)) potential numerical stability issue
-            // if alpha -> 1
-            float ra = 1.0f / (1.0f - alpha);
-
-            // update v_rgb for this gaussian
-            // because the weight is computed as: c_i (a_i G_i) * T : T =
-            // prod{1, i-1}(1 - a_j G_j) we have d(img)/d(c_i) = (a_i G_i) *
-            // T where alpha_i is a_i * G_i
-			const float weight = alpha * T;
-			float dL_dalpha = 0.0f;
-            for (uint32_t k = 0; k < CDIM; ++k) {
-                ar[k] += weight * color[k];
-				const float &dL_dchannel = dL_dpixel[k];
-                Register_dL_dcolors[k] += weight * dL_dchannel;
-                
-				dL_dalpha += ((color[k] * T) - ra * (-ar[k])) * dL_dchannel;
-            }
-
-            for (uint32_t k = 0; k < 3; ++k) {
-                an[k] += weight * normal[k];
-				const float &dL_dnchannel = dL_dnpixel[k];
-                Register_dL_dnormals[k] += weight * dL_dnchannel;
-
-                dL_dalpha += (normal[k] * T - ra * (-an[k])) * dL_dnchannel;
-            }
-
-            /*
-            * d(alpha_out) / d(alpha)
+    //////////////////////// batched run
+    int sm_batch = (BLOCK_SIZE/batch_factor) / 32;  // 256/8/32 = 1
+    uint32_t inner_i = 0;
+    for (int bch = 0; bch < batch_factor; ++bch) {
+        /*
+            * Fetch pixel data
             */
-            dL_dalpha += T_final * ra * v_render_a;
-            
-            if (backgrounds != nullptr) {
-                float bg_dot_dpixel = 0.0f;
+        block.sync();
+        for (int i = 0; i < sm_batch; ++i) {
+            int idx = tr * sm_batch + i;   // pix index in tile.
+            const uint2 pix = {pix_min.x + (idx + BLOCK_SIZE/batch_factor*bch) % tile_size, pix_min.y + (idx + BLOCK_SIZE/batch_factor*bch) / tile_size};
+            const uint32_t pix_id = image_width * pix.y + pix.x;
+            bool valid_pixel = pix.x < image_width && pix.y < image_height;
+            if (valid_pixel) {
+                median_id_batch[idx] = median_ids[pix_id];
+                v_median_batch[idx] = v_render_median[pix_id];
+                float4* sampled_stats_ptr = (float4*)sampled_stats;
+                sampled_stat_batch[idx] = sampled_stats_ptr[global_bucket_idx * BLOCK_SIZE + (idx + BLOCK_SIZE/batch_factor*bch)];      // (sampled_T, sampled_avd, sampled_aw, sampled_avwd)
+                T_final_batch[idx] = 1 - render_alphas[pix_id];
+                v_render_a_batch[idx] = v_render_alphas[pix_id];
+                last_contributor_batch[idx] = last_ids[pix_id];
+
+    #pragma unroll
                 for (uint32_t k = 0; k < CDIM; ++k) {
-                    bg_dot_dpixel += backgrounds[k] * dL_dpixel[k];
+                    render_colors_batch[idx * CDIM + k] = render_colors[pix_id * CDIM + k];
+                    sampled_ar_batch[idx * CDIM + k] = 
+                        sampled_ar[global_bucket_idx * BLOCK_SIZE * CDIM + k * BLOCK_SIZE + (idx + BLOCK_SIZE/batch_factor*bch)] + (backgrounds == nullptr ? 0 : T_final_batch[idx] * backgrounds[k]);
+                    v_render_colors_batch[idx * CDIM + k] = v_render_colors[pix_id * CDIM + k];
                 }
-                dL_dalpha += -T_final * ra * bg_dot_dpixel;
+
+                float4* sampled_an_ptr = (float4*) sampled_an;
+                float4 an_tmp = sampled_an_ptr[(global_bucket_idx * BLOCK_SIZE) + (idx + BLOCK_SIZE/batch_factor*bch)];
+                sampled_an_batch[idx] = {an_tmp.x, an_tmp.y, an_tmp.z};
+    #pragma unroll
+                for (uint32_t k = 0; k < 3; ++k) {
+                    render_normals_batch[idx * 3 + k] = render_normals[pix_id * 3 + k];
+                    v_render_normals_batch[idx * 3 + k] = v_render_normals[pix_id * 3 + k];
+                }
+                
+                if (v_render_distort != nullptr) {
+                    v_render_distort_batch[idx] = v_render_distort[pix_id];
+                    float2* render_stats_ptr = (float2*)render_stats;
+                    render_stat_batch[idx] = render_stats_ptr[pix_id];     // (vis_wd, w)
+                }
             }
-            
-            // contribution from distortion
+        }
+        // wait for other threads to collect the gaussians
+        block.sync();
+
+        // loop over all batches of primitives
+        for (; inner_i < BLOCK_SIZE + 31; ++inner_i) {
+            // SHUFFLING
+
+            // At this point, T already has my (1 - alpha) multiplied.
+            // So pass this ready-made T value to next thread.
+            median_idx = my_warp.shfl_up(median_idx, 1);
+            v_median = my_warp.shfl_up(v_median, 1);
+            T = my_warp.shfl_up(T, 1);
+            last_contributor = my_warp.shfl_up(last_contributor, 1);
+            T_final = my_warp.shfl_up(T_final, 1);
+    #pragma unroll
+            for (int k = 0; k < CDIM; ++k) {
+                ar[k] = my_warp.shfl_up(ar[k], 1);
+                dL_dpixel[k] = my_warp.shfl_up(dL_dpixel[k], 1);
+            }
+    #pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                an[k] = my_warp.shfl_up(an[k], 1);
+                dL_dnpixel[k] = my_warp.shfl_up(dL_dnpixel[k], 1);
+            }
             if (v_render_distort != nullptr) {
-                // last channel of colors is depth
-                float depth = color[CDIM - 1];
-                accum_d += weight * depth;
-                accum_w += weight;
-                accum_vis_wd += weight * (depth * accum_w - accum_d);
-                float distort_buffer = 
-                    2.0f * 
-                    (2.0f * (vis_wd_final - accum_vis_wd) -
-                        (d_final * accum_w - w_final * accum_d));
-                float dl_dw =
-                    2.0f *
-                    (2.0f * (depth * accum_w - accum_d) +
-                        (d_final - depth * w_final));
-                // df / d(alpha)
-                dL_dalpha += (dl_dw * T - distort_buffer * ra) * v_distort;
-                // df / d(depth). put it in the last channel of v_rgb
-                Register_dL_dcolors[CDIM - 1] += 2.0f * weight *
-                                            (2.0f - 2.0f * T - w_final + weight) *
-                                            v_distort;
+                v_distort = my_warp.shfl_up(v_distort, 1);
+                vis_wd_final = my_warp.shfl_up(vis_wd_final, 1);
+                d_final = my_warp.shfl_up(d_final, 1);
+                w_final = my_warp.shfl_up(w_final, 1);
+                accum_d = my_warp.shfl_up(accum_d, 1);
+                accum_w = my_warp.shfl_up(accum_w, 1);
+                accum_vis_wd = my_warp.shfl_up(accum_vis_wd, 1);
             }
 
-            T *= (1.0f - alpha);
-
-            /** ==================================================
-                * 2DGS backward pass: compute gradients of d_out / d_G_i and
-                * d_G_i w.r.t geometry parameters
-                * ==================================================
-                */
-            if (opac * vis <= 0.999f) {
-                float v_depth = 0.f;
-                // d(a_i * G_i) / d(G_i) = a_i
-                const float dL_dG = opac * dL_dalpha;
-
-                // case 1: in the forward pass, the proper ray-primitive
-                // intersection is used
-                if (gauss_weight_3d <= gauss_weight_2d) {
-
-                    // derivative of G_i w.r.t. ray-primitive intersection
-                    // uv coordinates
-                    const vec2 v_s = {
-                        dL_dG * -vis * s.x + v_depth * w_M.x,
-                        dL_dG * -vis * s.y + v_depth * w_M.y
-                    };
-
-                    // backward through the projective transform
-                    // @see rasterize_to_pixels_2dgs_fwd.cu to understand
-                    // what is going on here
-                    const vec3 v_z_w_M = {s.x, s.y, 1.0};
-                    const float v_sx_pz = v_s.x / ray_cross.z;
-                    const float v_sy_pz = v_s.y / ray_cross.z;
-                    const vec3 v_ray_cross = {
-                        v_sx_pz, v_sy_pz, -(v_sx_pz * s.x + v_sy_pz * s.y)
-                    };
-                    const vec3 v_h_u = glm::cross(h_v, v_ray_cross);
-                    const vec3 v_h_v = glm::cross(v_ray_cross, h_u);
-
-                    // derivative of ray-primitive intersection uv
-                    // coordinates w.r.t. transformation (geometry)
-                    // coefficients
-                    Register_dL_du_M += {-v_h_u.x, -v_h_u.y, -v_h_u.z};
-                    Register_dL_dv_M += {-v_h_v.x, -v_h_v.y, -v_h_v.z};
-                    Register_dL_dw_M += {
-                        pixf.x * v_h_u.x + pixf.y * v_h_v.x + v_depth * v_z_w_M.x,
-                        pixf.x * v_h_u.y + pixf.y * v_h_v.y + v_depth * v_z_w_M.y,
-                        pixf.x * v_h_u.z + pixf.y * v_h_v.z + v_depth * v_z_w_M.z
-                    };
-
-                    // case 2: in the forward pass, the 2D gaussian
-                    // projected gaussian weight is used
-                } else {
-                    // computing the derivative of G_i w.r.t. 2d projected
-                    // gaussian parameters (trivial)
-                    const float v_G_ddelx =
-                        -vis * FILTER_INV_SQUARE_2DGS * d.x;
-                    const float v_G_ddely =
-                        -vis * FILTER_INV_SQUARE_2DGS * d.y;
-                        Register_dL_dmeans2d += {dL_dG * v_G_ddelx, dL_dG * v_G_ddely};
-                    if (v_means2d_abs != nullptr) {
-                        Register_dL_dmeans2d_abs += {
-                            abs(Register_dL_dmeans2d.x), abs(Register_dL_dmeans2d.y)
-                        };
-                    }
+            // which pixel index should this thread deal with?
+            int idx = inner_i - BLOCK_SIZE/batch_factor*bch - my_warp.thread_rank();        // pix index in tile.
+            const uint2 pix = {pix_min.x + (idx + BLOCK_SIZE/batch_factor*bch) % tile_size, pix_min.y + (idx + BLOCK_SIZE/batch_factor*bch) / tile_size};
+            // const uint32_t pix_id = image_width * pix.y + pix.x;
+            const float2 pixf = {(float) pix.x + 0.5f, (float) pix.y + 0.5f};
+            bool valid_pixel = pix.x < image_width && pix.y < image_height;
+            
+            // every 32nd thread should read the stored state from memory
+            if (valid_splat && valid_pixel && my_warp.thread_rank() == 0 && idx < BLOCK_SIZE/batch_factor) {
+                median_idx = median_id_batch[idx];
+                v_median = v_median_batch[idx];
+                float4 sampled_stat = sampled_stat_batch[idx];      // (sampled_T, sampled_avd, sampled_aw, sampled_avwd)
+                T = sampled_stat.x;
+                T_final = T_final_batch[idx];
+                v_render_a = v_render_a_batch[idx];
+                last_contributor = last_contributor_batch[idx];
+    #pragma unroll
+                for (int k = 0; k < CDIM; ++k) {
+                    ar[k] = -render_colors_batch[idx * CDIM + k] + sampled_ar_batch[idx * CDIM + k];
+                    dL_dpixel[k] = v_render_colors_batch[idx * CDIM + k];
                 }
-                Register_dL_dopacities += vis * dL_dalpha;
+                float3 an_tmp = sampled_an_batch[idx];
+                float nx = render_normals_batch[idx * 3];
+                float ny = render_normals_batch[idx * 3 + 1];
+                float nz = render_normals_batch[idx * 3 + 2];
+                an[0] = -nx + an_tmp.x;
+                an[1] = -ny + an_tmp.y;
+                an[2] = -nz + an_tmp.z;
+    #pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    dL_dnpixel[k] = v_render_normals_batch[idx * 3 + k];
+                }
+                if (v_render_distort != nullptr) {
+                    v_distort = v_render_distort_batch[idx];
+                    float2 render_stat = render_stat_batch[idx];     // (vis_wd, w)
+                    vis_wd_final = render_stat.x;
+                    w_final = render_stat.y;
+                    d_final = render_colors_batch[idx * CDIM + CDIM - 1];
+                    accum_d = sampled_stat.y;
+                    accum_w = sampled_stat.z;
+                    accum_vis_wd = sampled_stat.w;
+                }
+            }
+
+            // do work
+            if (valid_splat && valid_pixel && 0 <= idx && idx < BLOCK_SIZE/batch_factor) {
+                if (image_width <= pix.x || image_height <= pix.y) continue;
+
+                if (splat_idx_global > last_contributor) continue;
+
+                vec3 h_u = pixf.x * w_M - u_M;
+                vec3 h_v = pixf.y * w_M - v_M;
+                vec3 ray_cross = glm::cross(h_u, h_v);
+
+                // no ray_crossion
+                if (ray_cross.z == 0.0) continue;
+
+                vec2 s = {ray_cross.x / ray_cross.z, ray_cross.y / ray_cross.z};
+
+                // GAUSSIAN KERNEL EVALUATION
+                float gauss_weight_3d = s.x * s.x + s.y * s.y;
+                vec2 d = {xy.x - pixf.x, xy.y - pixf.y};
+
+                // 2D gaussian weight using the projected 2D mean
+                float gauss_weight_2d =
+                    FILTER_INV_SQUARE_2DGS * (d.x * d.x + d.y * d.y);
+                float gauss_weight = min(gauss_weight_3d, gauss_weight_2d);
+
+                // visibility and alpha
+                const float sigma = 0.5f * gauss_weight;
+                float vis = __expf(-sigma);
+                float alpha = min(0.999f, opac * vis); // clipped alpha
+
+                // gaussian throw out
+                if (sigma < 0.f || alpha < ALPHA_THRESHOLD) continue;
+
+                // gradient contribution from median depth
+                if (splat_idx_global == median_idx) {
+                    // v_median is a special gradient input from forward pass
+                    // not yet clear what this is for
+                    Register_dL_dcolors[CDIM - 1] += v_median;
+                }
+
+                /**
+                    * d(img)/d(rgb) and d(img)/d(alpha)
+                    */
+
+                // compute the current T for this gaussian
+                // since the output T = coprod (1 - alpha_i), we have T_(inner_i-1) =
+                // T_i * 1/(1 - alpha_(inner_i-1)) potential numerical stability issue
+                // if alpha -> 1
+                float ra = 1.0f / (1.0f - alpha);
+
+                // update v_rgb for this gaussian
+                // because the weight is computed as: c_i (a_i G_i) * T : T =
+                // prod{1, inner_i-1}(1 - a_j G_j) we have d(img)/d(c_i) = (a_i G_i) *
+                // T where alpha_i is a_i * G_i
+                const float weight = alpha * T;
+                float dL_dalpha = 0.0f;
+                for (uint32_t k = 0; k < CDIM; ++k) {
+                    ar[k] += weight * color[k];
+                    const float &dL_dchannel = dL_dpixel[k];
+                    Register_dL_dcolors[k] += weight * dL_dchannel;
+                    
+                    dL_dalpha += ((color[k] * T) - ra * (-ar[k])) * dL_dchannel;
+                }
+
+                for (uint32_t k = 0; k < 3; ++k) {
+                    an[k] += weight * normal[k];
+                    const float &dL_dnchannel = dL_dnpixel[k];
+                    Register_dL_dnormals[k] += weight * dL_dnchannel;
+
+                    dL_dalpha += (normal[k] * T - ra * (-an[k])) * dL_dnchannel;
+                }
+
+                /*
+                * d(alpha_out) / d(alpha)
+                */
+                dL_dalpha += T_final * ra * v_render_a;
+                
+                if (backgrounds != nullptr) {
+                    float bg_dot_dpixel = 0.0f;
+                    for (uint32_t k = 0; k < CDIM; ++k) {
+                        bg_dot_dpixel += backgrounds[k] * dL_dpixel[k];
+                    }
+                    dL_dalpha += -T_final * ra * bg_dot_dpixel;
+                }
+                
+                // contribution from distortion
+                if (v_render_distort != nullptr) {
+                    // last channel of colors is depth
+                    float depth = color[CDIM - 1];
+                    accum_d += weight * depth;
+                    accum_w += weight;
+                    accum_vis_wd += weight * (depth * accum_w - accum_d);
+                    float distort_buffer = 
+                        2.0f * 
+                        (2.0f * (vis_wd_final - accum_vis_wd) -
+                            (d_final * accum_w - w_final * accum_d));
+                    float dl_dw =
+                        2.0f *
+                        (2.0f * (depth * accum_w - accum_d) +
+                            (d_final - depth * w_final));
+                    // df / d(alpha)
+                    dL_dalpha += (dl_dw * T - distort_buffer * ra) * v_distort;
+                    // df / d(depth). put it in the last channel of v_rgb
+                    Register_dL_dcolors[CDIM - 1] += 2.0f * weight *
+                                                (2.0f - 2.0f * T - w_final + weight) *
+                                                v_distort;
+                }
+
+                T *= (1.0f - alpha);
+
+                /** ==================================================
+                    * 2DGS backward pass: compute gradients of d_out / d_G_i and
+                    * d_G_i w.r.t geometry parameters
+                    * ==================================================
+                    */
+                if (opac * vis <= 0.999f) {
+                    float v_depth = 0.f;
+                    // d(a_i * G_i) / d(G_i) = a_i
+                    const float dL_dG = opac * dL_dalpha;
+
+                    // case 1: in the forward pass, the proper ray-primitive
+                    // intersection is used
+                    if (gauss_weight_3d <= gauss_weight_2d) {
+
+                        // derivative of G_i w.r.t. ray-primitive intersection
+                        // uv coordinates
+                        const vec2 v_s = {
+                            dL_dG * -vis * s.x + v_depth * w_M.x,
+                            dL_dG * -vis * s.y + v_depth * w_M.y
+                        };
+
+                        // backward through the projective transform
+                        // @see rasterize_to_pixels_2dgs_fwd.cu to understand
+                        // what is going on here
+                        const vec3 v_z_w_M = {s.x, s.y, 1.0};
+                        const float v_sx_pz = v_s.x / ray_cross.z;
+                        const float v_sy_pz = v_s.y / ray_cross.z;
+                        const vec3 v_ray_cross = {
+                            v_sx_pz, v_sy_pz, -(v_sx_pz * s.x + v_sy_pz * s.y)
+                        };
+                        const vec3 v_h_u = glm::cross(h_v, v_ray_cross);
+                        const vec3 v_h_v = glm::cross(v_ray_cross, h_u);
+
+                        // derivative of ray-primitive intersection uv
+                        // coordinates w.r.t. transformation (geometry)
+                        // coefficients
+                        Register_dL_du_M += {-v_h_u.x, -v_h_u.y, -v_h_u.z};
+                        Register_dL_dv_M += {-v_h_v.x, -v_h_v.y, -v_h_v.z};
+                        Register_dL_dw_M += {
+                            pixf.x * v_h_u.x + pixf.y * v_h_v.x + v_depth * v_z_w_M.x,
+                            pixf.x * v_h_u.y + pixf.y * v_h_v.y + v_depth * v_z_w_M.y,
+                            pixf.x * v_h_u.z + pixf.y * v_h_v.z + v_depth * v_z_w_M.z
+                        };
+
+                        // case 2: in the forward pass, the 2D gaussian
+                        // projected gaussian weight is used
+                    } else {
+                        // computing the derivative of G_i w.r.t. 2d projected
+                        // gaussian parameters (trivial)
+                        const float v_G_ddelx =
+                            -vis * FILTER_INV_SQUARE_2DGS * d.x;
+                        const float v_G_ddely =
+                            -vis * FILTER_INV_SQUARE_2DGS * d.y;
+                            Register_dL_dmeans2d += {dL_dG * v_G_ddelx, dL_dG * v_G_ddely};
+                        if (v_means2d_abs != nullptr) {
+                            Register_dL_dmeans2d_abs += {
+                                abs(Register_dL_dmeans2d.x), abs(Register_dL_dmeans2d.y)
+                            };
+                        }
+                    }
+                    Register_dL_dopacities += vis * dL_dalpha;
+                }
             }
         }
     }
@@ -1284,243 +1367,6 @@ void tensor_diff_check(const at::Tensor& a, const at::Tensor& b, float atol) {
            (long long)count, (long long)a_cpu.numel());
 }
 
-template <uint32_t CDIM>
-void launch_rasterize_to_pixels_2dgs_bwd_kernel(
-    // Gaussian parameters
-    const at::Tensor means2d,                   // [..., N, 2] or [nnz, 2]
-    const at::Tensor ray_transforms,            // [..., N, 3, 3] or [nnz, 3, 3]
-    const at::Tensor colors,                    // [..., N, 3] or [nnz, 3]
-    const at::Tensor opacities,                 // [..., N] or [nnz]
-    const at::Tensor normals,                   // [..., N, 3] or [nnz, 3]
-    const at::Tensor densify,                   // [..., N, 2] or [nnz, 2]
-    const at::optional<at::Tensor> backgrounds, // [..., CDIM]
-    const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
-    // image size
-    const uint32_t image_width,
-    const uint32_t image_height,
-    const uint32_t tile_size,
-    // ray_crossions
-    const at::Tensor tile_offsets, // [..., tile_height, tile_width]
-    const at::Tensor flatten_ids,  // [n_isects]
-    // forward outputs
-    const at::Tensor render_colors, // [..., image_height, image_width, CDIM]
-    const at::Tensor render_alphas, // [..., image_height, image_width, 1]
-    const at::Tensor render_normals, // [..., image_height, image_width, 3]
-    const at::Tensor render_vis_wd, // [..., image_height, image_width, 1]
-    const at::Tensor render_w, // [..., image_height, image_width, 1]
-    const at::Tensor last_ids,      // [..., image_height, image_width]
-    const at::Tensor median_ids,    // [..., image_height, image_width]
-    // efficient backward
-    const uint32_t num_buckets,
-    const at::Tensor per_tile_bucket_offset,
-    const at::Tensor bucket_to_tile,
-    const at::Tensor sampled_T,
-    const at::Tensor sampled_ar,
-    const at::Tensor sampled_an,
-    const at::Tensor sampled_avd,
-    const at::Tensor sampled_aw,
-    const at::Tensor sampled_avwd,
-    const at::Tensor max_contrib,
-    // gradients of outputs
-    const at::Tensor v_render_colors,  // [..., image_height, image_width, 3]
-    const at::Tensor v_render_alphas,  // [..., image_height, image_width, 1]
-    const at::Tensor v_render_normals, // [..., image_height, image_width, 3]
-    const at::Tensor v_render_distort, // [..., image_height, image_width, 1]
-    const at::Tensor v_render_median,  // [..., image_height, image_width, 1]
-    // outputs
-    at::optional<at::Tensor> v_means2d_abs, // [..., N, 2] or [nnz, 2]
-    at::Tensor v_means2d,                   // [..., N, 2] or [nnz, 2]
-    at::Tensor v_ray_transforms,            // [..., N, 3, 3] or [nnz, 3, 3]
-    at::Tensor v_colors,                    // [..., N, 3] or [nnz, 3]
-    at::Tensor v_opacities,                 // [..., N] or [nnz]
-    at::Tensor v_normals,                   // [..., N, 3] or [nnz, 3]
-    at::Tensor v_densify                    // [..., N, 2] or [nnz, 2]
-) {
-    bool packed = means2d.dim() == 2;
-
-    uint32_t N = packed ? 0 : means2d.size(-2); // number of gaussians
-    uint32_t I = render_alphas.numel() / (image_height * image_width); // number of images
-    uint32_t tile_height = tile_offsets.size(-2);
-    uint32_t tile_width = tile_offsets.size(-1);
-    uint32_t n_isects = flatten_ids.size(0);
-
-    // Each block covers a tile on the image. In total there are
-    // I * tile_height * tile_width blocks.
-    dim3 threads = {tile_size, tile_size, 1};
-    dim3 grid = {I, tile_height, tile_width};
-
-    int64_t shmem_size =
-        tile_size * tile_size *
-        (sizeof(int32_t) + sizeof(vec3) + sizeof(vec3) + sizeof(vec3) +
-         sizeof(vec3) + sizeof(float) * CDIM + sizeof(float) * 3);
-
-    if (n_isects == 0) {
-        // skip the kernel launch if there are no elements
-        return;
-    }
-
-    // TODO: an optimization can be done by passing the actual number of
-    // channels into the kernel functions and avoid necessary global memory
-    // writes. This requires moving the channel padding from python to C side.
-    if (cudaFuncSetAttribute(
-            rasterize_to_pixels_2dgs_bwd_kernel<CDIM, float>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            shmem_size
-        ) != cudaSuccess) {
-        AT_ERROR(
-            "Failed to set maximum shared memory size (requested ",
-            shmem_size,
-            " bytes), try lowering tile_size."
-        );
-    }
-
-    rasterize_to_pixels_2dgs_bwd_kernel<CDIM, float>
-        <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
-            I,
-            N,
-            n_isects,
-            packed,
-            reinterpret_cast<vec2 *>(means2d.data_ptr<float>()),
-            ray_transforms.data_ptr<float>(),
-            colors.data_ptr<float>(),
-            normals.data_ptr<float>(),
-            opacities.data_ptr<float>(),
-            backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
-                                    : nullptr,
-            masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
-            image_width,
-            image_height,
-            tile_size,
-            tile_width,
-            tile_height,
-            tile_offsets.data_ptr<int32_t>(),
-            flatten_ids.data_ptr<int32_t>(),
-            render_colors.data_ptr<float>(),
-            render_alphas.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>(),
-            median_ids.data_ptr<int32_t>(),
-            v_render_colors.data_ptr<float>(),
-            v_render_alphas.data_ptr<float>(),
-            v_render_normals.data_ptr<float>(),
-            v_render_distort.data_ptr<float>(),
-            v_render_median.data_ptr<float>(),
-            v_means2d_abs.has_value()
-                ? reinterpret_cast<vec2 *>(
-                      v_means2d_abs.value().data_ptr<float>()
-                  )
-                : nullptr,
-            reinterpret_cast<vec2 *>(v_means2d.data_ptr<float>()),
-            v_ray_transforms.data_ptr<float>(),
-            v_colors.data_ptr<float>(),
-            v_opacities.data_ptr<float>(),
-            v_normals.data_ptr<float>(),
-            v_densify.data_ptr<float>()
-        );
-
-
-
-
-    // for test
-    if (cudaFuncSetAttribute(
-        per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel<CDIM, float>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            shmem_size
-        ) != cudaSuccess) {
-        AT_ERROR(
-            "Failed to set maximum shared memory size (requested ",
-            shmem_size,
-            " bytes), try lowering tile_size."
-        );
-    }
-
-    at::Tensor copy_v_means2d_abs = at::zeros_like(v_means2d);
-    at::Tensor copy_v_means2d = at::zeros_like(v_means2d);
-    at::Tensor copy_v_ray_transforms = at::zeros_like(v_ray_transforms);
-    at::Tensor copy_v_colors = at::zeros_like(v_colors);
-    at::Tensor copy_v_opacities = at::zeros_like(v_opacities);
-    at::Tensor copy_v_normals = at::zeros_like(v_normals);
-    at::Tensor copy_v_densify = at::zeros_like(v_densify);
-    
-	const int THREADS = 32;
-    per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel<CDIM, float>
-        <<<((num_buckets * 32) + THREADS - 1) / THREADS, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-            I,
-            N,
-            n_isects,
-            packed,
-            reinterpret_cast<vec2 *>(means2d.data_ptr<float>()),
-            ray_transforms.data_ptr<float>(),
-            colors.data_ptr<float>(),
-            normals.data_ptr<float>(),
-            opacities.data_ptr<float>(),
-            backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
-                                    : nullptr,
-            masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
-            image_width,
-            image_height,
-            tile_size,
-            tile_width,
-            tile_height,
-            tile_offsets.data_ptr<int32_t>(),
-            flatten_ids.data_ptr<int32_t>(),
-            render_colors.data_ptr<float>(),
-            render_alphas.data_ptr<float>(),
-            render_normals.data_ptr<float>(),
-            render_vis_wd.data_ptr<float>(),
-            render_w.data_ptr<float>(),
-            last_ids.data_ptr<int32_t>(),
-            median_ids.data_ptr<int32_t>(),
-            num_buckets,
-            per_tile_bucket_offset.data_ptr<int32_t>(),
-            bucket_to_tile.data_ptr<int32_t>(),
-            sampled_T.data_ptr<float>(),
-            sampled_ar.data_ptr<float>(),
-            sampled_an.data_ptr<float>(),
-            sampled_avd.data_ptr<float>(),
-            sampled_aw.data_ptr<float>(),
-            sampled_avwd.data_ptr<float>(),
-            max_contrib.data_ptr<int32_t>(),
-            v_render_colors.data_ptr<float>(),
-            v_render_alphas.data_ptr<float>(),
-            v_render_normals.data_ptr<float>(),
-            v_render_distort.data_ptr<float>(),
-            v_render_median.data_ptr<float>(),
-            v_means2d_abs.has_value()
-                ? reinterpret_cast<vec2 *>(
-                      copy_v_means2d_abs.data_ptr<float>()
-                  )
-                : nullptr,
-            reinterpret_cast<vec2 *>(copy_v_means2d.data_ptr<float>()),
-            copy_v_ray_transforms.data_ptr<float>(),
-            copy_v_colors.data_ptr<float>(),
-            copy_v_opacities.data_ptr<float>(),
-            copy_v_normals.data_ptr<float>(),
-            copy_v_densify.data_ptr<float>()
-        );
-
-    // const float TOLERANCE = 0.00001f;
-    // bool b0 = v_means2d_abs.has_value() ? all_close_custom(copy_v_means2d_abs, v_means2d_abs.value(), TOLERANCE): 1;
-    // bool b1 = all_close_custom(copy_v_means2d, v_means2d, TOLERANCE);
-    // bool b2 = all_close_custom(copy_v_ray_transforms, v_ray_transforms, TOLERANCE);
-    // bool b3 = all_close_custom(copy_v_colors, v_colors, TOLERANCE);
-    // bool b4 = all_close_custom(copy_v_opacities, v_opacities, TOLERANCE);
-    // bool b5 = all_close_custom(copy_v_normals, v_normals, TOLERANCE);
-    // bool b6 = all_close_custom(copy_v_densify, v_densify, TOLERANCE);
-    // if (!b0 || !b1 || !b2 || !b3 || !b4 || !b5 || !b6) {
-    //     printf("v_means2d_abs %d, v_means2d %d, v_ray_transforms %d, v_colors %d, v_opacities %d, v_normals %d, v_densify %d \n",
-    //         b0, b1, b2, b3, b4, b5, b6);
-    //     printf("detect diff!");
-    //     if (!b0) tensor_diff_check(copy_v_means2d_abs, v_means2d_abs.value(), TOLERANCE);
-    //     if (!b1) tensor_diff_check(copy_v_means2d, v_means2d, TOLERANCE);
-    //     if (!b2) tensor_diff_check(copy_v_ray_transforms, v_ray_transforms, TOLERANCE);
-    //     if (!b3) tensor_diff_check(copy_v_colors, v_colors, TOLERANCE);
-    //     if (!b4) tensor_diff_check(copy_v_opacities, v_opacities, TOLERANCE);
-    //     if (!b5) tensor_diff_check(copy_v_normals, v_normals, TOLERANCE);
-    //     if (!b6) tensor_diff_check(copy_v_densify, v_densify, TOLERANCE);
-    // }
-}
-
-// // per-gaussian backward
 // template <uint32_t CDIM>
 // void launch_rasterize_to_pixels_2dgs_bwd_kernel(
 //     // Gaussian parameters
@@ -1543,20 +1389,16 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
 //     const at::Tensor render_colors, // [..., image_height, image_width, CDIM]
 //     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
 //     const at::Tensor render_normals, // [..., image_height, image_width, 3]
-//     const at::Tensor render_vis_wd, // [..., image_height, image_width, 1]
-//     const at::Tensor render_w, // [..., image_height, image_width, 1]
+//     const at::Tensor render_stats, // [..., image_height, image_width, 2]
 //     const at::Tensor last_ids,      // [..., image_height, image_width]
 //     const at::Tensor median_ids,    // [..., image_height, image_width]
 //     // efficient backward
 //     const uint32_t num_buckets,
 //     const at::Tensor per_tile_bucket_offset,
 //     const at::Tensor bucket_to_tile,
-//     const at::Tensor sampled_T,
+//     const at::Tensor sampled_stats,
 //     const at::Tensor sampled_ar,
 //     const at::Tensor sampled_an,
-//     const at::Tensor sampled_avd,
-//     const at::Tensor sampled_aw,
-//     const at::Tensor sampled_avwd,
 //     const at::Tensor max_contrib,
 //     // gradients of outputs
 //     const at::Tensor v_render_colors,  // [..., image_height, image_width, 3]
@@ -1600,6 +1442,72 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
 //     // channels into the kernel functions and avoid necessary global memory
 //     // writes. This requires moving the channel padding from python to C side.
 //     if (cudaFuncSetAttribute(
+//             rasterize_to_pixels_2dgs_bwd_kernel<CDIM, float>,
+//             cudaFuncAttributeMaxDynamicSharedMemorySize,
+//             shmem_size
+//         ) != cudaSuccess) {
+//         AT_ERROR(
+//             "Failed to set maximum shared memory size (requested ",
+//             shmem_size,
+//             " bytes), try lowering tile_size."
+//         );
+//     }
+
+//     rasterize_to_pixels_2dgs_bwd_kernel<CDIM, float>
+//         <<<grid, threads, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
+//             I,
+//             N,
+//             n_isects,
+//             packed,
+//             reinterpret_cast<vec2 *>(means2d.data_ptr<float>()),
+//             ray_transforms.data_ptr<float>(),
+//             colors.data_ptr<float>(),
+//             normals.data_ptr<float>(),
+//             opacities.data_ptr<float>(),
+//             backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
+//                                     : nullptr,
+//             masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
+//             image_width,
+//             image_height,
+//             tile_size,
+//             tile_width,
+//             tile_height,
+//             tile_offsets.data_ptr<int32_t>(),
+//             flatten_ids.data_ptr<int32_t>(),
+//             render_colors.data_ptr<float>(),
+//             render_alphas.data_ptr<float>(),
+//             last_ids.data_ptr<int32_t>(),
+//             median_ids.data_ptr<int32_t>(),
+//             v_render_colors.data_ptr<float>(),
+//             v_render_alphas.data_ptr<float>(),
+//             v_render_normals.data_ptr<float>(),
+//             v_render_distort.data_ptr<float>(),
+//             v_render_median.data_ptr<float>(),
+//             v_means2d_abs.has_value()
+//                 ? reinterpret_cast<vec2 *>(
+//                       v_means2d_abs.value().data_ptr<float>()
+//                   )
+//                 : nullptr,
+//             reinterpret_cast<vec2 *>(v_means2d.data_ptr<float>()),
+//             v_ray_transforms.data_ptr<float>(),
+//             v_colors.data_ptr<float>(),
+//             v_opacities.data_ptr<float>(),
+//             v_normals.data_ptr<float>(),
+//             v_densify.data_ptr<float>()
+//         );
+
+
+
+
+//     // for test
+//     shmem_size =
+//         tile_size * tile_size / 8 *   // batch_factor = 8
+//         (sizeof(int32_t) + sizeof(float) + sizeof(float4) + sizeof(float) +
+//          sizeof(float) + sizeof(float) + sizeof(float) * CDIM +
+//          sizeof(float) * CDIM + sizeof(float) * CDIM + sizeof(float3) +
+//          sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) + sizeof(float2));
+         
+//     if (cudaFuncSetAttribute(
 //         per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel<CDIM, float>,
 //             cudaFuncAttributeMaxDynamicSharedMemorySize,
 //             shmem_size
@@ -1610,64 +1518,232 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
 //             " bytes), try lowering tile_size."
 //         );
 //     }
+
+//     at::Tensor copy_v_means2d_abs = at::zeros_like(v_means2d);
+//     at::Tensor copy_v_means2d = at::zeros_like(v_means2d);
+//     at::Tensor copy_v_ray_transforms = at::zeros_like(v_ray_transforms);
+//     at::Tensor copy_v_colors = at::zeros_like(v_colors);
+//     at::Tensor copy_v_opacities = at::zeros_like(v_opacities);
+//     at::Tensor copy_v_normals = at::zeros_like(v_normals);
+//     at::Tensor copy_v_densify = at::zeros_like(v_densify);
     
-	// const int THREADS = 32;
-    // per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel<CDIM, float>
-    //     <<<((num_buckets * 32) + THREADS - 1) / THREADS, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-    //         I,
-    //         N,
-    //         n_isects,
-    //         packed,
-    //         reinterpret_cast<vec2 *>(means2d.data_ptr<float>()),
-    //         ray_transforms.data_ptr<float>(),
-    //         colors.data_ptr<float>(),
-    //         normals.data_ptr<float>(),
-    //         opacities.data_ptr<float>(),
-    //         backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
-    //                                 : nullptr,
-    //         masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
-    //         image_width,
-    //         image_height,
-    //         tile_size,
-    //         tile_width,
-    //         tile_height,
-    //         tile_offsets.data_ptr<int32_t>(),
-    //         flatten_ids.data_ptr<int32_t>(),
-    //         render_colors.data_ptr<float>(),
-    //         render_alphas.data_ptr<float>(),
-    //         render_normals.data_ptr<float>(),
-    //         render_vis_wd.data_ptr<float>(),
-    //         render_w.data_ptr<float>(),
-    //         last_ids.data_ptr<int32_t>(),
-    //         median_ids.data_ptr<int32_t>(),
-    //         num_buckets,
-    //         per_tile_bucket_offset.data_ptr<int32_t>(),
-    //         bucket_to_tile.data_ptr<int32_t>(),
-    //         sampled_T.data_ptr<float>(),
-    //         sampled_ar.data_ptr<float>(),
-    //         sampled_an.data_ptr<float>(),
-    //         sampled_avd.data_ptr<float>(),
-    //         sampled_aw.data_ptr<float>(),
-    //         sampled_avwd.data_ptr<float>(),
-    //         max_contrib.data_ptr<int32_t>(),
-    //         v_render_colors.data_ptr<float>(),
-    //         v_render_alphas.data_ptr<float>(),
-    //         v_render_normals.data_ptr<float>(),
-    //         v_render_distort.data_ptr<float>(),
-    //         v_render_median.data_ptr<float>(),
-    //         v_means2d_abs.has_value()
-    //             ? reinterpret_cast<vec2 *>(
-    //                   v_means2d_abs.value().data_ptr<float>()
-    //               )
-    //             : nullptr,
-    //         reinterpret_cast<vec2 *>(v_means2d.data_ptr<float>()),
-    //         v_ray_transforms.data_ptr<float>(),
-    //         v_colors.data_ptr<float>(),
-    //         v_opacities.data_ptr<float>(),
-    //         v_normals.data_ptr<float>(),
-    //         v_densify.data_ptr<float>()
-    //     );
+// 	const int THREADS = 32;
+//     per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel<CDIM, float>
+//         <<<((num_buckets * 32) + THREADS - 1) / THREADS, THREADS, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
+//             I,
+//             N,
+//             n_isects,
+//             packed,
+//             reinterpret_cast<vec2 *>(means2d.data_ptr<float>()),
+//             ray_transforms.data_ptr<float>(),
+//             colors.data_ptr<float>(),
+//             normals.data_ptr<float>(),
+//             opacities.data_ptr<float>(),
+//             backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
+//                                     : nullptr,
+//             masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
+//             image_width,
+//             image_height,
+//             tile_size,
+//             tile_width,
+//             tile_height,
+//             tile_offsets.data_ptr<int32_t>(),
+//             flatten_ids.data_ptr<int32_t>(),
+//             render_colors.data_ptr<float>(),
+//             render_alphas.data_ptr<float>(),
+//             render_normals.data_ptr<float>(),
+//             render_stats.data_ptr<float>(),
+//             last_ids.data_ptr<int32_t>(),
+//             median_ids.data_ptr<int32_t>(),
+//             num_buckets,
+//             per_tile_bucket_offset.data_ptr<int32_t>(),
+//             bucket_to_tile.data_ptr<int32_t>(),
+//             sampled_stats.data_ptr<float>(),
+//             sampled_ar.data_ptr<float>(),
+//             sampled_an.data_ptr<float>(),
+//             max_contrib.data_ptr<int32_t>(),
+//             v_render_colors.data_ptr<float>(),
+//             v_render_alphas.data_ptr<float>(),
+//             v_render_normals.data_ptr<float>(),
+//             v_render_distort.data_ptr<float>(),
+//             v_render_median.data_ptr<float>(),
+//             v_means2d_abs.has_value()
+//                 ? reinterpret_cast<vec2 *>(
+//                       copy_v_means2d_abs.data_ptr<float>()
+//                   )
+//                 : nullptr,
+//             reinterpret_cast<vec2 *>(copy_v_means2d.data_ptr<float>()),
+//             copy_v_ray_transforms.data_ptr<float>(),
+//             copy_v_colors.data_ptr<float>(),
+//             copy_v_opacities.data_ptr<float>(),
+//             copy_v_normals.data_ptr<float>(),
+//             copy_v_densify.data_ptr<float>()
+//         );
+
+//     // const float TOLERANCE = 0.00001f;
+//     // bool b0 = v_means2d_abs.has_value() ? all_close_custom(copy_v_means2d_abs, v_means2d_abs.value(), TOLERANCE): 1;
+//     // bool b1 = all_close_custom(copy_v_means2d, v_means2d, TOLERANCE);
+//     // bool b2 = all_close_custom(copy_v_ray_transforms, v_ray_transforms, TOLERANCE);
+//     // bool b3 = all_close_custom(copy_v_colors, v_colors, TOLERANCE);
+//     // bool b4 = all_close_custom(copy_v_opacities, v_opacities, TOLERANCE);
+//     // bool b5 = all_close_custom(copy_v_normals, v_normals, TOLERANCE);
+//     // bool b6 = all_close_custom(copy_v_densify, v_densify, TOLERANCE);
+//     // if (!b0 || !b1 || !b2 || !b3 || !b4 || !b5 || !b6) {
+//     //     printf("v_means2d_abs %d, v_means2d %d, v_ray_transforms %d, v_colors %d, v_opacities %d, v_normals %d, v_densify %d \n",
+//     //         b0, b1, b2, b3, b4, b5, b6);
+//     //     printf("detect diff!");
+//     //     if (!b0) tensor_diff_check(copy_v_means2d_abs, v_means2d_abs.value(), TOLERANCE);
+//     //     if (!b1) tensor_diff_check(copy_v_means2d, v_means2d, TOLERANCE);
+//     //     if (!b2) tensor_diff_check(copy_v_ray_transforms, v_ray_transforms, TOLERANCE);
+//     //     if (!b3) tensor_diff_check(copy_v_colors, v_colors, TOLERANCE);
+//     //     if (!b4) tensor_diff_check(copy_v_opacities, v_opacities, TOLERANCE);
+//     //     if (!b5) tensor_diff_check(copy_v_normals, v_normals, TOLERANCE);
+//     //     if (!b6) tensor_diff_check(copy_v_densify, v_densify, TOLERANCE);
+//     // }
 // }
+
+// per-gaussian backward
+template <uint32_t CDIM>
+void launch_rasterize_to_pixels_2dgs_bwd_kernel(
+    // Gaussian parameters
+    const at::Tensor means2d,                   // [..., N, 2] or [nnz, 2]
+    const at::Tensor ray_transforms,            // [..., N, 3, 3] or [nnz, 3, 3]
+    const at::Tensor colors,                    // [..., N, 3] or [nnz, 3]
+    const at::Tensor opacities,                 // [..., N] or [nnz]
+    const at::Tensor normals,                   // [..., N, 3] or [nnz, 3]
+    const at::Tensor densify,                   // [..., N, 2] or [nnz, 2]
+    const at::optional<at::Tensor> backgrounds, // [..., CDIM]
+    const at::optional<at::Tensor> masks,       // [..., tile_height, tile_width]
+    // image size
+    const uint32_t image_width,
+    const uint32_t image_height,
+    const uint32_t tile_size,
+    // ray_crossions
+    const at::Tensor tile_offsets, // [..., tile_height, tile_width]
+    const at::Tensor flatten_ids,  // [n_isects]
+    // forward outputs
+    const at::Tensor render_colors, // [..., image_height, image_width, CDIM]
+    const at::Tensor render_alphas, // [..., image_height, image_width, 1]
+    const at::Tensor render_normals, // [..., image_height, image_width, 3]
+    const at::Tensor render_stats, // [..., image_height, image_width, 2]
+    const at::Tensor last_ids,      // [..., image_height, image_width]
+    const at::Tensor median_ids,    // [..., image_height, image_width]
+    // efficient backward
+    const uint32_t num_buckets,
+    const at::Tensor per_tile_bucket_offset,
+    const at::Tensor bucket_to_tile,
+    const at::Tensor sampled_stats,
+    const at::Tensor sampled_ar,
+    const at::Tensor sampled_an,
+    const at::Tensor max_contrib,
+    // gradients of outputs
+    const at::Tensor v_render_colors,  // [..., image_height, image_width, 3]
+    const at::Tensor v_render_alphas,  // [..., image_height, image_width, 1]
+    const at::Tensor v_render_normals, // [..., image_height, image_width, 3]
+    const at::Tensor v_render_distort, // [..., image_height, image_width, 1]
+    const at::Tensor v_render_median,  // [..., image_height, image_width, 1]
+    // outputs
+    at::optional<at::Tensor> v_means2d_abs, // [..., N, 2] or [nnz, 2]
+    at::Tensor v_means2d,                   // [..., N, 2] or [nnz, 2]
+    at::Tensor v_ray_transforms,            // [..., N, 3, 3] or [nnz, 3, 3]
+    at::Tensor v_colors,                    // [..., N, 3] or [nnz, 3]
+    at::Tensor v_opacities,                 // [..., N] or [nnz]
+    at::Tensor v_normals,                   // [..., N, 3] or [nnz, 3]
+    at::Tensor v_densify                    // [..., N, 2] or [nnz, 2]
+) {
+    bool packed = means2d.dim() == 2;
+
+    uint32_t N = packed ? 0 : means2d.size(-2); // number of gaussians
+    uint32_t I = render_alphas.numel() / (image_height * image_width); // number of images
+    uint32_t tile_height = tile_offsets.size(-2);
+    uint32_t tile_width = tile_offsets.size(-1);
+    uint32_t n_isects = flatten_ids.size(0);
+
+    // Each block covers a tile on the image. In total there are
+    // I * tile_height * tile_width blocks.
+    dim3 threads = {tile_size, tile_size, 1};
+    dim3 grid = {I, tile_height, tile_width};
+
+    int64_t shmem_size =
+        tile_size * tile_size / 8 *   // batch_factor = 8
+        (sizeof(int32_t) + sizeof(float) + sizeof(float4) + sizeof(float) +
+         sizeof(float) + sizeof(float) + sizeof(float) * CDIM +
+         sizeof(float) * CDIM + sizeof(float) * CDIM + sizeof(float3) +
+         sizeof(float) * 3 + sizeof(float) * 3 + sizeof(float) + sizeof(float2));
+
+    if (n_isects == 0) {
+        // skip the kernel launch if there are no elements
+        return;
+    }
+
+    // TODO: an optimization can be done by passing the actual number of
+    // channels into the kernel functions and avoid necessary global memory
+    // writes. This requires moving the channel padding from python to C side.
+    if (cudaFuncSetAttribute(
+        per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel<CDIM, float>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            shmem_size
+        ) != cudaSuccess) {
+        AT_ERROR(
+            "Failed to set maximum shared memory size (requested ",
+            shmem_size,
+            " bytes), try lowering tile_size."
+        );
+    }
+    
+	const int THREADS = 32;
+    per_gaussian_rasterize_to_pixels_2dgs_bwd_kernel<CDIM, float>
+        <<<((num_buckets * 32) + THREADS - 1) / THREADS, THREADS, shmem_size, at::cuda::getCurrentCUDAStream()>>>(
+            I,
+            N,
+            n_isects,
+            packed,
+            reinterpret_cast<vec2 *>(means2d.data_ptr<float>()),
+            ray_transforms.data_ptr<float>(),
+            colors.data_ptr<float>(),
+            normals.data_ptr<float>(),
+            opacities.data_ptr<float>(),
+            backgrounds.has_value() ? backgrounds.value().data_ptr<float>()
+                                    : nullptr,
+            masks.has_value() ? masks.value().data_ptr<bool>() : nullptr,
+            image_width,
+            image_height,
+            tile_size,
+            tile_width,
+            tile_height,
+            tile_offsets.data_ptr<int32_t>(),
+            flatten_ids.data_ptr<int32_t>(),
+            render_colors.data_ptr<float>(),
+            render_alphas.data_ptr<float>(),
+            render_normals.data_ptr<float>(),
+            render_stats.data_ptr<float>(),
+            last_ids.data_ptr<int32_t>(),
+            median_ids.data_ptr<int32_t>(),
+            num_buckets,
+            per_tile_bucket_offset.data_ptr<int32_t>(),
+            bucket_to_tile.data_ptr<int32_t>(),
+            sampled_stats.data_ptr<float>(),
+            sampled_ar.data_ptr<float>(),
+            sampled_an.data_ptr<float>(),
+            max_contrib.data_ptr<int32_t>(),
+            v_render_colors.data_ptr<float>(),
+            v_render_alphas.data_ptr<float>(),
+            v_render_normals.data_ptr<float>(),
+            v_render_distort.data_ptr<float>(),
+            v_render_median.data_ptr<float>(),
+            v_means2d_abs.has_value()
+                ? reinterpret_cast<vec2 *>(
+                      v_means2d_abs.value().data_ptr<float>()
+                  )
+                : nullptr,
+            reinterpret_cast<vec2 *>(v_means2d.data_ptr<float>()),
+            v_ray_transforms.data_ptr<float>(),
+            v_colors.data_ptr<float>(),
+            v_opacities.data_ptr<float>(),
+            v_normals.data_ptr<float>(),
+            v_densify.data_ptr<float>()
+        );
+}
 
 // Explicit Instantiation: this should match how it is being called in .cpp
 // file.
@@ -1690,20 +1766,16 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
         const at::Tensor render_colors,                                        \
         const at::Tensor render_alphas,                                        \
         const at::Tensor render_normals,                                       \
-        const at::Tensor render_vis_wd,                                        \
-        const at::Tensor render_w,                                        \
+        const at::Tensor render_stats,                                         \
         const at::Tensor last_ids,                                             \
         const at::Tensor median_ids,                                           \
         const uint32_t num_buckets,                                            \
         const at::Tensor per_tile_bucket_offset,                               \
-        const at::Tensor bucket_to_tile,                                             \
-        const at::Tensor sampled_T,                                                  \
-        const at::Tensor sampled_ar,                                                 \
-        const at::Tensor sampled_an,                                                 \
-        const at::Tensor sampled_avd,                                          \
-        const at::Tensor sampled_aw,                                           \
-        const at::Tensor sampled_avwd,                                         \
-        const at::Tensor max_contrib,                                                \
+        const at::Tensor bucket_to_tile,                                       \
+        const at::Tensor sampled_stats,                                        \
+        const at::Tensor sampled_ar,                                           \
+        const at::Tensor sampled_an,                                           \
+        const at::Tensor max_contrib,                                          \
         const at::Tensor v_render_colors,                                      \
         const at::Tensor v_render_alphas,                                      \
         const at::Tensor v_render_normals,                                     \

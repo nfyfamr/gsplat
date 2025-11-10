@@ -63,12 +63,9 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
     // efficient backward
     const int32_t *__restrict__ per_tile_bucket_offset,
     int32_t *__restrict__ bucket_to_tile,
-    scalar_t *__restrict__ sampled_T,
+    scalar_t *__restrict__ sampled_stats,   // (sampled_T, sampled_avd, sampled_aw, sampled_avwd)
     scalar_t *__restrict__ sampled_ar,
     scalar_t *__restrict__ sampled_an,
-    scalar_t *__restrict__ sampled_avd,
-    scalar_t *__restrict__ sampled_aw,
-    scalar_t *__restrict__ sampled_avwd,
     int32_t *__restrict__ max_contrib,
 
     // outputs
@@ -76,8 +73,7 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
         *__restrict__ render_colors, // [..., image_height, image_width, CDIM]
     scalar_t *__restrict__ render_alphas,  // [..., image_height, image_width, 1]
     scalar_t *__restrict__ render_normals, // [..., image_height, image_width, 3]
-    scalar_t *__restrict__ render_vis_wd, // [..., image_height, image_width, 1]
-    scalar_t *__restrict__ render_w, // [..., image_height, image_width, 1]
+    scalar_t *__restrict__ render_stats, // [..., image_height, image_width, 2]     // (vis_wd, w)
     scalar_t *__restrict__ render_distort, // [..., image_height, image_width, 1]
                                            // // Stores the per-pixel distortion
                                            // error proposed in Mip-NeRF 360.
@@ -357,23 +353,17 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
         uint32_t batch_size = min(block_size, range_end - batch_start);
         for (uint32_t t = 0; (t < batch_size) && !done; ++t) {
             // add incoming T and accumulated radiance (ar) value for every 32nd gaussian
-            uint32_t global_gaussian_idx_in_tile = b * block_size + t;
+            // uint32_t global_gaussian_idx_in_tile = b * block_size + t;
             if (t % 32 == 0) {
                 uint32_t sample_bucket_idx = bbm_current + bucket_idx_counter;
-                sampled_T[(sample_bucket_idx * block_size) + tr] = T;
+                float4* sampled_stats_ptr = (float4*)sampled_stats;
+                sampled_stats_ptr[(sample_bucket_idx * block_size) + tr] = make_float4(T, accum_vis_depth, accum_w, accum_vis_wd);
                 for (uint32_t ch = 0; ch < CDIM; ++ch) {
                     uint32_t ar_idx = (sample_bucket_idx * block_size * CDIM) + (ch * block_size) + tr;
                     sampled_ar[ar_idx] = pix_out[ch];
                 }
-                for (uint32_t k = 0; k < 3; ++k) {
-                    uint32_t arn_idx = (sample_bucket_idx * block_size * 3) + (k * block_size) + tr;
-                    sampled_an[arn_idx] = normal_out[k];
-                }
-                if (render_distort != nullptr) {
-                    sampled_avd[(sample_bucket_idx * block_size) + tr] = accum_vis_depth;
-                    sampled_aw[(sample_bucket_idx * block_size) + tr] = accum_w;
-                    sampled_avwd[(sample_bucket_idx * block_size) + tr] = accum_vis_wd;
-                }
+                float4* sampled_an_ptr = (float4*) sampled_an;
+                sampled_an_ptr[(sample_bucket_idx * block_size) + tr] = make_float4(normal_out[0], normal_out[1], normal_out[2], 0);
                 bucket_idx_counter++;
             }
 
@@ -488,8 +478,8 @@ __global__ void rasterize_to_pixels_2dgs_fwd_kernel(
 
         if (render_distort != nullptr) {
             render_distort[pix_id] = distort;
-            render_vis_wd[pix_id] = accum_vis_wd;
-            render_w[pix_id] = accum_w;
+            float2* render_stats_ptr = (float2*)render_stats;
+            render_stats_ptr[pix_id] = make_float2(accum_vis_wd, accum_w);
         }
 
         render_median[pix_id] = median_depth;
@@ -526,19 +516,15 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
     // efficient backward
     const at::Tensor per_tile_bucket_offset,
     at::Tensor bucket_to_tile,
-    at::Tensor sampled_T,
+    at::Tensor sampled_stats,
     at::Tensor sampled_ar,
     at::Tensor sampled_an,
-    at::Tensor sampled_avd,
-    at::Tensor sampled_aw,
-    at::Tensor sampled_avwd,
     at::Tensor max_contrib,
     // outputs
     at::Tensor renders,        // [..., image_height, image_width, channels]
     at::Tensor alphas,         // [..., image_height, image_width]
     at::Tensor render_normals, // [..., image_height, image_width, 3]
-    at::Tensor render_vis_wd,  // [..., image_height, image_width, 1]
-    at::Tensor render_w,       // [..., image_height, image_width, 1]
+    at::Tensor render_stats,  // [..., image_height, image_width, 2]
     at::Tensor render_distort, // [..., image_height, image_width]
     at::Tensor render_median,  // [..., image_height, image_width]
     at::Tensor last_ids,       // [..., image_height, image_width]
@@ -599,18 +585,14 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
             flatten_ids.data_ptr<int32_t>(),
             per_tile_bucket_offset.data_ptr<int32_t>(),
             bucket_to_tile.data_ptr<int32_t>(),
-            sampled_T.data_ptr<float>(),
+            sampled_stats.data_ptr<float>(),
             sampled_ar.data_ptr<float>(),
             sampled_an.data_ptr<float>(),
-            sampled_avd.data_ptr<float>(),
-            sampled_aw.data_ptr<float>(),
-            sampled_avwd.data_ptr<float>(),
             max_contrib.data_ptr<int32_t>(),
             renders.data_ptr<float>(),
             alphas.data_ptr<float>(),
             render_normals.data_ptr<float>(),
-            render_vis_wd.data_ptr<float>(),
-            render_w.data_ptr<float>(),
+            render_stats.data_ptr<float>(),
             render_distort.data_ptr<float>(),
             render_median.data_ptr<float>(),
             last_ids.data_ptr<int32_t>(),
@@ -637,18 +619,14 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
         const at::Tensor flatten_ids,                                          \
         const at::Tensor per_tile_bucket_offset,                               \
         at::Tensor bucket_to_tile,                                             \
-        at::Tensor sampled_T,                                                  \
+        at::Tensor sampled_stats,                                              \
         at::Tensor sampled_ar,                                                 \
         at::Tensor sampled_an,                                                 \
-        at::Tensor sampled_avd,                                                \
-        at::Tensor sampled_aw,                                                 \
-        at::Tensor sampled_avwd,                                               \
         at::Tensor max_contrib,                                                \
         at::Tensor renders,                                                    \
         at::Tensor alphas,                                                     \
         at::Tensor render_normals,                                             \
-        at::Tensor render_vis_wd,                                              \
-        at::Tensor render_w,                                                   \
+        at::Tensor render_stats,                                               \
         at::Tensor render_distort,                                             \
         at::Tensor render_median,                                              \
         at::Tensor last_ids,                                                   \

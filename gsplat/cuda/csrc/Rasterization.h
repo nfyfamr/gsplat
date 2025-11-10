@@ -119,19 +119,15 @@ void launch_rasterize_to_pixels_2dgs_fwd_kernel(
     // efficient backward
     const at::Tensor per_tile_bucket_offset,
     at::Tensor bucket_to_tile,
-    at::Tensor sampled_T,
+    at::Tensor sampled_stats,
     at::Tensor sampled_ar,
     at::Tensor sampled_an,
-    at::Tensor sampled_avd,
-    at::Tensor sampled_aw,
-    at::Tensor sampled_avwd,
     at::Tensor max_contrib,
     // outputs
     at::Tensor renders,        // [..., image_height, image_width, channels]
     at::Tensor alphas,         // [..., image_height, image_width, 1]
     at::Tensor render_normals, // [..., image_height, image_width, 3]
-    at::Tensor render_vis_wd, // [..., image_height, image_width, 1]
-    at::Tensor render_w,       // [..., image_height, image_width, 1]
+    at::Tensor render_stats, // [..., image_height, image_width, 2]
     at::Tensor render_distort, // [..., image_height, image_width, 1]
     at::Tensor render_median,  // [..., image_height, image_width, 1]
     at::Tensor last_ids,       // [..., image_height, image_width]
@@ -159,20 +155,16 @@ void launch_rasterize_to_pixels_2dgs_bwd_kernel(
     const at::Tensor render_colors, // [..., image_height, image_width, CDIM]
     const at::Tensor render_alphas, // [..., image_height, image_width, 1]
     const at::Tensor render_normals, // [..., image_height, image_width, CDIM]
-    const at::Tensor render_vis_wd, // [..., image_height, image_width, 1]
-    const at::Tensor render_w,      // [..., image_height, image_width, 1]
+    const at::Tensor render_stats, // [..., image_height, image_width, 2]
     const at::Tensor last_ids,      // [..., image_height, image_width]
     const at::Tensor median_ids,    // [..., image_height, image_width]
     // efficient backward
     const uint32_t num_buckets,
     const at::Tensor per_tile_bucket_offset,
     const at::Tensor bucket_to_tile,
-    const at::Tensor sampled_T,
+    const at::Tensor sampled_stats,
     const at::Tensor sampled_ar,
     const at::Tensor sampled_an,
-    const at::Tensor sampled_avd,
-    const at::Tensor sampled_aw,
-    const at::Tensor sampled_avwd,
     const at::Tensor max_contrib,
     // gradients of outputs
     const at::Tensor v_render_colors,  // [..., image_height, image_width, 3]
